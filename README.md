@@ -74,11 +74,14 @@ buffer, the web UI, the Reachy SDK glue.
 
 Honest position, as of this commit:
 
-- **Phase 1, the voice loop: code complete and tested.** 63 tests pass, and the
-  speech client, the audio-in path and the whole
-  stream → sentences → speech loop have been run against real `llama-server`
-  and `llama-tts-server` processes from a development machine, using WAV files
-  rather than a live microphone.
+- **Phase 1, the voice loop: verified on real hardware.** `setup.sh` (prebuilt
+  fast path) and `start.sh` were run end to end on a Jetson Orin Nano Super
+  8 GB: both models load in ~27 s, a text question through the CLI answers with
+  a **794 ms first token at 12.5 tok/s**, a spoken WAV through the fork's own
+  `generate_stream(audio_b64=...)` answers correctly with a **1.19 s first
+  token**, and the speech client returns real 24 kHz audio. 63 tests pass.
+  Only a live microphone and speaker remain untested in this phase - the board
+  was driven over SSH.
 - **Not yet run on the robot.** Face tracking, speaking gestures, the acoustic
   echo cancellation and the microphone path itself are inherited from upstream
   and unchanged, but none of them have been exercised since the model swap. The
