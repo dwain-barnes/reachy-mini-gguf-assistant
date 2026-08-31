@@ -213,6 +213,30 @@ drop_caches() {  # drop_caches <what-is-about-to-load>
     ok "page cache freed before loading $what (MemFree now $(meminfo_mb MemFree) MB)"
 }
 
+# A single drop before the load is not always enough: reading gigabytes of
+# weights refills the page cache DURING the load, and NvMap can starve on an
+# allocation that arrives mid-way. Some boots win that race, some lose it -
+# same command, same free memory. The reliable form is a loop that keeps the
+# cache empty for the whole load window.
+DROP_LOOP_PID=""
+start_drop_loop() {
+    [ "$DROP_CACHES" -eq 1 ] || return 0
+    if [ "$(id -u)" -eq 0 ]; then
+        ( while :; do sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; sleep 2; done ) &
+        DROP_LOOP_PID=$!
+    elif sudo -n true 2>/dev/null; then
+        sudo -n sh -c 'while :; do sync; echo 3 > /proc/sys/vm/drop_caches; sleep 2; done' 2>/dev/null &
+        DROP_LOOP_PID=$!
+    fi
+}
+stop_drop_loop() {
+    if [ -n "$DROP_LOOP_PID" ]; then
+        kill "$DROP_LOOP_PID" 2>/dev/null || sudo -n kill "$DROP_LOOP_PID" 2>/dev/null || true
+        wait "$DROP_LOOP_PID" 2>/dev/null
+        DROP_LOOP_PID=""
+    fi
+}
+
 step "Making room for the first model"
 info "MemFree $(meminfo_mb MemFree) MB, MemAvailable $(meminfo_mb MemAvailable) MB"
 info "NvMap allocates out of MemFree only, so MemAvailable is not the number that matters"
@@ -304,6 +328,7 @@ step "Starting the part that listens, sees and thinks"
 info "Gemma 4 E2B on the GPU, $NGL layers, ${CTX} token context, $PARALLEL slot(s)"
 
 drop_caches "the language model"
+start_drop_loop   # keep it empty for the whole load - see the comment above
 
 # --reasoning off is not optional. Gemma 4 is a thinking model; left on, it
 # spends the whole token budget reasoning and returns empty content, which the
@@ -325,9 +350,11 @@ T0=$(date +%s)
 info "loading - expect 30 to 60 seconds. MemFree will dive to almost nothing"
 info "on the way; that is fine as long as the cache was dropped first."
 if ! wait_http "$LLM_URL/health" 600 "the thinking model" "$PID_LLM"; then
+    stop_drop_loop
     llm_failure_hint
     exit 1
 fi
+stop_drop_loop
 ok "thinking model loaded ($(( $(date +%s) - T0 ))s), MemFree $(meminfo_mb MemFree) MB"
 
 # ------------------------------------------------------------- speech model
@@ -339,6 +366,7 @@ ok "thinking model loaded ($(( $(date +%s) - T0 ))s), MemFree $(meminfo_mb MemFr
 step "Starting the part that speaks"
 
 drop_caches "the speech model"
+start_drop_loop
 
 if [ "$TTS_ON_GPU" -eq 1 ]; then
     info "Pocket TTS on the GPU, $TTS_NGL layers - roughly 30x faster than the CPU path"
@@ -382,6 +410,7 @@ PID_TTS=$!
 CHILDREN+=("$PID_TTS")
 
 if ! wait_http "$TTS_URL/health" 600 "the speaking model" "$PID_TTS"; then
+    stop_drop_loop
     if [ "$TTS_ON_GPU" -eq 1 ]; then
         warn "GPU speech did not fit alongside the language model. Set"
         warn "  \"ttsOnGpu\": false"
@@ -394,6 +423,7 @@ if ! wait_http "$TTS_URL/health" 600 "the speaking model" "$PID_TTS"; then
     fi
     exit 1
 fi
+stop_drop_loop
 ok "speaking model loaded ($(( $(date +%s) - T0 ))s), MemFree $(meminfo_mb MemFree) MB"
 
 # ----------------------------------------------------------------- warm-up
