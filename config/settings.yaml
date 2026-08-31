@@ -68,8 +68,10 @@ tts:
 audio:
   sample_rate: 16000
   channels: 2
-  input_device: "Reachy Mini Audio"
-  output_device: "Anker PowerConf"       # preferred TTS speaker; switchable live in the web UI
+  input_device: "Reachy Mini"            # matches both hardware revisions: the mics
+                                         # appear as "Reachy Mini Audio" on older units
+                                         # and "Reachy Mini Camera" on newer ones
+  output_device: "platform-sound"        # Jetson's own output; switchable live in the web UI
   echo_cancellation: true                 # WebRTC AEC: Reachy mic + currently selected speaker
 
 vad:
