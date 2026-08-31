@@ -18,6 +18,7 @@
 #   ./setup.sh --skip-build         only fetch models and make the venv
 #   ./setup.sh --skip-models        only build
 #   ./setup.sh --skip-venv          leave Python alone
+#   ./setup.sh --no-robot           skip the Reachy Mini wiring (SDK, udev, audio)
 #   ./setup.sh --force              re-resolve every path
 set -euo pipefail
 
@@ -61,8 +62,13 @@ VOICE_FILE="unmute-prod-website/default_voice.wav"
 SKIP_BUILD=0
 SKIP_MODELS=0
 SKIP_VENV=0
+SKIP_ROBOT=0
 FORCE=0
 WANT_PREBUILT=auto            # auto | always | never
+
+# The Reachy Mini SDK, pinned to the version this fork is runtime-tested on.
+REACHY_SDK_VERSION="1.3.1"
+UDEV_RULES_FILE="/etc/udev/rules.d/99-reachy-mini.rules"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -73,8 +79,9 @@ while [ $# -gt 0 ]; do
         --skip-build)        SKIP_BUILD=1; shift ;;
         --skip-models)       SKIP_MODELS=1; shift ;;
         --skip-venv)         SKIP_VENV=1; shift ;;
+        --no-robot)          SKIP_ROBOT=1; shift ;;
         --force)             FORCE=1; shift ;;
-        -h|--help)           sed -n '5,21p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -h|--help)           sed -n '5,22p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *)                   echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -94,6 +101,13 @@ ok()   { printf '    %s[ok]%s %s\n'   "$C_OK"   "$C_OFF" "$*"; }
 info() { printf '    %s%s%s\n'        "$C_DIM"  "$*"     "$C_OFF"; }
 warn() { printf '    %s[!]%s %s\n'    "$C_WARN" "$C_OFF" "$*"; }
 die()  { printf '    %s[x]%s %s\n'    "$C_ERR"  "$C_OFF" "$*" >&2; exit 1; }
+
+# Can we run sudo without a password prompt nobody is here to answer? A terminal
+# gets the normal prompt; a headless/scripted run only qualifies if the sudo
+# timestamp is already cached (sudo -v) or the rule is NOPASSWD. Same guard the
+# apt step below uses - callers print the exact commands instead of letting sudo
+# abort with something cryptic.
+can_sudo() { [ -t 0 ] || sudo -n true 2>/dev/null; }
 
 echo
 printf '  %sReachy Mini GGUF Assistant - setup%s\n' "$C_HEAD" "$C_OFF"
@@ -468,10 +482,202 @@ else
     "$VENV_DIR/bin/pip" install -r "$REPO/requirements.txt" \
         || die "pip install failed - see the output above"
     ok "python packages installed"
-    info "the robot SDK is separate:  $VENV_DIR/bin/pip install reachy-mini"
+    info "the robot SDK is handled by the Reachy step below (or --no-robot to skip it)"
     info "Jetson wheels, if you have not already:"
     info "    $VENV_DIR/bin/pip install numpy==1.26.4"
     info "    $VENV_DIR/bin/pip install onnxruntime-gpu --extra-index-url https://pypi.jetson-ai-lab.io/jp6/cu126"
+fi
+
+# ------------------------------------------------------------------- robot
+#
+# Everything the robot itself needs, none of which the steps above cover: the
+# SDK and scipy inside the venv, the apt packages the SDK builds and runs
+# against, the udev rules that make the serial port reachable without root, and
+# dialout membership. All of it verified on a Jetson Orin Nano Super driving a
+# Reachy Mini Lite; the notes below are what that bring-up actually cost.
+#
+# Idempotent throughout: an apt package already installed, a udev file already
+# byte-identical, a group already joined and a pinned SDK already present are
+# all left alone.
+
+ROBOT_TODO=0        # set when something was left for the user to do by hand
+
+robot_seen() {
+    [ -e /dev/reachy_mini ] && return 0
+    command -v lsusb >/dev/null 2>&1 || return 1
+    # 2e8a:000a is the RP2040 serial port upstream documents. Newer revisions
+    # ship a QinHeng CH343 (1a86:55d3) instead, and 38fb:1002 is the SunplusIT
+    # camera - which on those units is also what the microphone array
+    # enumerates under.
+    lsusb 2>/dev/null | grep -qiE '2e8a:000a|1a86:55d3|38fb:1002'
+}
+
+if [ "$SKIP_ROBOT" -eq 1 ]; then
+    step "Skipping the Reachy Mini setup (--no-robot)"
+else
+    step "Reachy Mini"
+
+    if robot_seen; then
+        ok "a Reachy Mini looks to be plugged in"
+    else
+        info "no Reachy Mini seen on USB right now - setting it up anyway, so the"
+        info "robot works the moment you plug it in. Pass --no-robot to skip this."
+    fi
+
+    # ---- apt: what the SDK builds against, and what the daemon needs to run.
+    #
+    # libportaudio2 is the one that bites. Without it the Reachy daemon does not
+    # limp along without sound, it dies at startup with
+    #   OSError: PortAudio library not found
+    # which reads like a Python packaging problem and is not. The three -dev
+    # packages are only needed while pip builds PyGObject/pycairo for the SDK.
+    ROBOT_APT=(libcairo2-dev libgirepository1.0-dev pkg-config
+               libportaudio2 portaudio19-dev)
+    ROBOT_MISSING=()
+    for p in "${ROBOT_APT[@]}"; do
+        dpkg -s "$p" >/dev/null 2>&1 || ROBOT_MISSING+=("$p")
+    done
+
+    INSTALLED_PORTAUDIO=0
+    if [ ${#ROBOT_MISSING[@]} -eq 0 ]; then
+        ok "robot apt packages already installed"
+    elif can_sudo; then
+        info "installing: ${ROBOT_MISSING[*]}"
+        # Not fatal if it fails: the rest of setup still has to finish and write
+        # config/servers.local.json, and everything but the robot works without.
+        if sudo apt-get update && sudo apt-get install -y "${ROBOT_MISSING[@]}"; then
+            ok "robot apt packages installed"
+            case " ${ROBOT_MISSING[*]} " in *" libportaudio2 "*) INSTALLED_PORTAUDIO=1 ;; esac
+        else
+            warn "apt could not install: ${ROBOT_MISSING[*]}"
+            ROBOT_TODO=1
+        fi
+    else
+        warn "cannot ask for a sudo password without a terminal - skipping the apt step."
+        warn "run this once, then re-run ./setup.sh:"
+        warn "    sudo apt-get install -y ${ROBOT_MISSING[*]}"
+        ROBOT_TODO=1
+    fi
+
+    # A daemon that was already running when libportaudio2 arrived has already
+    # failed to find it and will not look again. Kill it so the next connect
+    # spawns a fresh one; the app starts it on demand.
+    if [ "$INSTALLED_PORTAUDIO" -eq 1 ] && pgrep -f reachy-mini-daemon >/dev/null 2>&1; then
+        pkill -f reachy-mini-daemon 2>/dev/null || sudo -n pkill -f reachy-mini-daemon 2>/dev/null || true
+        info "stopped the running reachy-mini-daemon so it picks up PortAudio"
+    fi
+
+    # ---- udev: both vendors, one file.
+    #
+    # Upstream documents only 2e8a:000a. Newer robots present a QinHeng CH343
+    # (1a86:55d3) and match nothing, so /dev/reachy_mini never appears and the
+    # SDK cannot open the port without root. Ship both lines - the wrong one
+    # simply never matches.
+    UDEV_WANT="$(cat <<'RULES'
+# Reachy Mini serial port. Two vendors on purpose: 2e8a:000a is the RP2040 that
+# upstream documents, 1a86:55d3 the QinHeng CH343 on newer hardware revisions.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000a", MODE="0666", SYMLINK+="reachy_mini"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", MODE="0666", SYMLINK+="reachy_mini"
+RULES
+)"
+
+    if [ -f "$UDEV_RULES_FILE" ] && [ "$(cat "$UDEV_RULES_FILE")" = "$UDEV_WANT" ]; then
+        ok "$UDEV_RULES_FILE is already correct"
+    elif can_sudo; then
+        if printf '%s\n' "$UDEV_WANT" | sudo tee "$UDEV_RULES_FILE" >/dev/null \
+           && sudo udevadm control --reload-rules && sudo udevadm trigger; then
+            ok "wrote $UDEV_RULES_FILE and reloaded udev"
+            if [ -e /dev/reachy_mini ]; then
+                ok "/dev/reachy_mini -> $(readlink -f /dev/reachy_mini 2>/dev/null || echo '?')"
+            else
+                info "/dev/reachy_mini will appear when the robot is plugged in"
+            fi
+        else
+            warn "could not write or reload $UDEV_RULES_FILE"
+            ROBOT_TODO=1
+        fi
+    else
+        warn "cannot write $UDEV_RULES_FILE without a sudo password - skipping."
+        warn "run this once, then re-run ./setup.sh:"
+        warn "    sudo tee $UDEV_RULES_FILE >/dev/null <<'EOF'"
+        printf '%s\n' "$UDEV_WANT" | sed 's/^/        /'
+        warn "    EOF"
+        warn "    sudo udevadm control --reload-rules && sudo udevadm trigger"
+        ROBOT_TODO=1
+    fi
+
+    # ---- dialout, so the serial port is readable as a normal user.
+    ROBOT_USER="${SUDO_USER:-$(id -un)}"
+    if id -nG "$ROBOT_USER" 2>/dev/null | tr ' ' '\n' | grep -qx dialout; then
+        ok "$ROBOT_USER is already in the dialout group"
+    elif can_sudo; then
+        if sudo usermod -aG dialout "$ROBOT_USER"; then
+            ok "added $ROBOT_USER to the dialout group"
+            warn "group membership only applies to NEW logins - log out and back in"
+            warn "(or reboot) before starting the robot."
+        else
+            warn "could not add $ROBOT_USER to dialout"
+            ROBOT_TODO=1
+        fi
+    else
+        warn "cannot add $ROBOT_USER to dialout without a sudo password - skipping."
+        warn "run this once, then log out and back in:"
+        warn "    sudo usermod -aG dialout $ROBOT_USER"
+        ROBOT_TODO=1
+    fi
+
+    # ---- the SDK and scipy, inside the venv.
+    if [ ! -x "$VENV_DIR/bin/pip" ]; then
+        warn "no virtualenv at $VENV_DIR - re-run without --skip-venv to get the SDK"
+        ROBOT_TODO=1
+    else
+        if "$VENV_DIR/bin/python3" - "$REACHY_SDK_VERSION" <<'PY' >/dev/null 2>&1
+import importlib.metadata as md, sys
+sys.exit(0 if md.version("reachy-mini") == sys.argv[1] else 1)
+PY
+        then
+            ok "reachy-mini $REACHY_SDK_VERSION already in the venv"
+        else
+            info "installing reachy-mini==$REACHY_SDK_VERSION (builds PyGObject; a few minutes)"
+            # Not fatal: the rest of setup (including config/servers.local.json)
+            # still has to finish, and everything but the robot works without it.
+            if "$VENV_DIR/bin/pip" install "reachy-mini==$REACHY_SDK_VERSION"; then
+                ok "reachy-mini $REACHY_SDK_VERSION installed"
+            else
+                warn "the SDK would not install. If it failed building pycairo or"
+                warn "PyGObject, the apt packages above are the fix; install them"
+                warn "and re-run ./setup.sh."
+                ROBOT_TODO=1
+            fi
+        fi
+
+        # The SDK's audio helpers resample with scipy and do not declare it.
+        if "$VENV_DIR/bin/python3" -c 'import scipy' >/dev/null 2>&1; then
+            ok "scipy already in the venv"
+        else
+            info "installing scipy (the SDK's audio path needs it)"
+            if "$VENV_DIR/bin/pip" install scipy; then
+                ok "scipy installed"
+            else
+                warn "scipy would not install - the robot's audio path needs it"
+                ROBOT_TODO=1
+            fi
+        fi
+
+        # reachy-mini declares numpy>=2.2.5; the Jetson onnxruntime-gpu wheel
+        # wants 1.x. It runs either way, but say so rather than let a later
+        # import error look mysterious.
+        if "$VENV_DIR/bin/python3" -c 'import onnxruntime' >/dev/null 2>&1 \
+           && ! "$VENV_DIR/bin/python3" -c 'import numpy,sys; sys.exit(0 if numpy.__version__.startswith("1.") else 1)' >/dev/null 2>&1; then
+            warn "numpy is 2.x now and the Jetson onnxruntime-gpu wheel expects 1.x."
+            warn "if ONNX starts complaining:  $VENV_DIR/bin/pip install numpy==1.26.4"
+        fi
+    fi
+
+    info "audio on newer robot revisions: the mic array enumerates under the CAMERA"
+    info "name (\"Reachy Mini Camera\"), and there is no USB speaker at all - speech"
+    info "comes out of the Jetson. config/settings.yaml is already set for both."
+    info "if the robot shows up on USB with no audio interface, unplug and replug it."
 fi
 
 # ------------------------------------------------------------------ config
@@ -524,6 +730,11 @@ if [ "$MISSING" -eq 0 ] && [ "$SKIP_BUILD" -eq 0 ]; then
         warn "re-run with --build-from-source to compile against your own CUDA."
         MISSING=1
     fi
+fi
+
+if [ "$ROBOT_TODO" -eq 1 ]; then
+    warn "some of the robot setup needed a sudo password and was skipped -"
+    warn "run the commands printed above, then re-run ./setup.sh."
 fi
 
 echo
