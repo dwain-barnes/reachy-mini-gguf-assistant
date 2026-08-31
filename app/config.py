@@ -12,6 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified by the reachy-mini-gguf-assistant contributors, 2026:
+# new PipelineConfig (unified vs split), TTSConfig now describes an HTTP
+# speech server rather than Kokoro, VisionConfig gains vlm_base_url for split
+# mode, and RAG is off by default.
 
 """Configuration — loads settings.yaml into typed dataclasses."""
 
@@ -44,12 +49,27 @@ class STTConfig:
 
 
 @dataclass
+class PipelineConfig:
+    """How an utterance reaches the model.
+
+    unified: the WAV goes to Gemma as an input_audio part — no STT at all.
+    split:   the fork parent's path, faster-whisper then a separate VLM. Kept
+             as the A/B escape hatch for comparing vision quality.
+    """
+    mode: str = "unified"
+    # Real transcripts for the web UI cost a second Whisper pass and, in
+    # unified mode, a second llama-server slot (-np 2). Off by default; the UI
+    # shows a "spoken" chip with the utterance length instead.
+    transcribe_for_display: bool = False
+
+
+@dataclass
 class TTSConfig:
-    voice: str = "af_sarah"
-    speed: float = 1.0
-    lang: str = "en-us"
-    first_chunk_words: int = 3
-    max_chunk_words: int = 8
+    """llama-tts-server (Pocket TTS GGUF) over HTTP."""
+    base_url: str = "http://127.0.0.1:8100"
+    voice: str = ""            # empty = the reference voice the server started with
+    max_seconds: float = 30.0  # runaway cap; scaled down per sentence
+    timeout: float = 300.0
 
 
 @dataclass
@@ -81,8 +101,11 @@ class VisionConfig:
     jpeg_quality: int = 80
     frames: int = 3
     capture_fps: float = 10.0
+    # Split mode only: a second llama-server holding a vision model. Empty
+    # means "use llm.base_url", which is what unified mode always does.
+    vlm_base_url: str = ""
     system_prompt: str = (
-        "You are a vision assistant on an NVIDIA Jetson device with a live camera. "
+        "You are a robot with a live camera. "
         "Answer in one to two sentences. Be direct and concise."
     )
     few_shot: List[Dict[str, str]] = field(default_factory=list)
@@ -134,7 +157,9 @@ class ReachyConfig:
 
 @dataclass
 class RAGConfig:
-    enabled: bool = True
+    # Off in this fork: the embedding server was a third model on a board that
+    # only has room for two. Turn it on with your own embedding endpoint.
+    enabled: bool = False
     knowledge_dir: str = "./knowledge_base"
     persist_dir: str = "./data/chromadb"
     embedding_backend: str = "llamacpp"
@@ -154,6 +179,7 @@ class WebConfig:
 
 
 _SECTIONS = [
+    ("pipeline", "pipeline", PipelineConfig),
     ("llm", "llm", LLMConfig),
     ("stt", "stt", STTConfig),
     ("tts", "tts", TTSConfig),
@@ -168,6 +194,7 @@ _SECTIONS = [
 
 @dataclass
 class Config:
+    pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     stt: STTConfig = field(default_factory=STTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)

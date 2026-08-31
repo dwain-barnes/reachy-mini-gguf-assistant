@@ -13,10 +13,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified by the reachy-mini-gguf-assistant contributors, 2026:
+# unified mode sends the utterance itself to Gemma alongside the camera frames
+# and never loads faster-whisper; the browser gets a "spoken" chip instead of a
+# transcript; the reply is cut into sentences rather than 3- and 8-word chunks;
+# speech comes from llama-tts-server.
 
 """
 Web Vision Chat — browser UI + terminal output simultaneously.
-Mic -> Silero VAD -> [camera] -> STT -> VLM -> TTS -> Speaker
+
+  unified (default):  Mic -> VAD -> [camera] -> Gemma (audio + images) -> TTS -> Speaker
+  split:              Mic -> VAD -> [camera] -> STT -> VLM -> TTS -> Speaker
+
                + WebSocket broadcast to connected browsers.
 
 Usage:
@@ -38,15 +47,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from app.config import Config
 from app.audio import find_alsa_device
-from app.stt import STT
 from app.llm import LLM
-from app.tts import create_tts
+from app.tts_client import create_tts
 from app.camera import Camera
 from app.monitor import get_system_stats, get_jetson_model
 from app.pipeline import (
-    SAMPLE_RATE, TTS_BREAKS, MicRecorder, warmup_stt, vad_loop,
-    tts_player, load_silero,
+    AUDIO_PROMPT, SAMPLE_RATE, MicRecorder, warmup_stt, vad_loop,
+    segment_to_wav_b64, tts_player, load_silero,
 )
+from app.sentence_split import is_speakable, split_sentences
 from app.reachy import kill_stale_camera_holders, connect as connect_reachy
 from app.face_detector import FaceDetector
 from app.face_tracker import FaceTracker
@@ -145,6 +154,10 @@ def main():
     args = parser.parse_args()
 
     config = Config.load()
+    unified = (config.pipeline.mode or "unified").lower() != "split"
+    # A transcript for the browser is optional in unified mode: it costs a
+    # second Whisper pass purely for display.
+    want_transcript = config.pipeline.transcribe_for_display or not unified
     web_host = args.host or config.web.host
     web_port = args.port or config.web.port
     broadcaster = Broadcaster()
@@ -152,7 +165,8 @@ def main():
     console.print(Panel.fit(
         "[bold cyan]Web Vision Chat[/bold cyan]\n"
         "Speak anytime — camera captures when you speak\n"
-        f"[dim]Web UI: http://{{host}}:{web_port}  |  Ctrl-C to quit[/dim]",
+        f"[dim]{'audio straight to the model' if unified else 'STT + VLM (split)'}"
+        f"  |  Web UI: http://{{host}}:{web_port}  |  Ctrl-C to quit[/dim]",
         border_style="cyan",
     ))
 
@@ -233,22 +247,30 @@ def main():
     # ── Load models ──────────────────────────────────────────────
     console.print("\n[bold]Loading...[/bold]")
 
-    stt = STT(
-        model=config.stt.model, device=config.stt.device,
-        compute_type=config.stt.compute_type, language=config.stt.language,
-        beam_size=config.stt.beam_size,
-    )
-    stt.load()
-    console.print(f"  ✓ STT (faster-whisper, {config.stt.model})")
-    console.print("    CUDA warmup...", end=" ")
-    console.print(f"done ({warmup_stt(stt):.1f}s)")
+    if want_transcript:
+        from app.stt import STT
+        stt = STT(
+            model=config.stt.model, device=config.stt.device,
+            compute_type=config.stt.compute_type, language=config.stt.language,
+            beam_size=config.stt.beam_size,
+        )
+        stt.load()
+        console.print(f"  ✓ STT (faster-whisper, {config.stt.model})")
+        console.print("    CUDA warmup...", end=" ")
+        console.print(f"done ({warmup_stt(stt):.1f}s)")
+        if unified:
+            console.print("    [dim](display only — the model still hears the audio itself)[/dim]")
+    else:
+        console.print("  ✓ No STT — the model hears the microphone itself")
 
     silero_model = load_silero(console)
 
     vision_system_prompt = config.vision.system_prompt
     vision_few_shot = config.vision.few_shot or []
     llm = LLM(
-        model=config.llm.model, base_url=config.llm.base_url,
+        model=config.llm.model,
+        base_url=config.llm.base_url if unified
+                 else (config.vision.vlm_base_url or config.llm.base_url),
         backend=config.llm.backend, max_tokens=config.llm.max_tokens,
         temperature=config.llm.temperature, timeout=config.llm.timeout,
         system_prompt=vision_system_prompt,
@@ -257,11 +279,12 @@ def main():
     console.print(f"  ✓ VLM ({llm.model})")
 
     tts = create_tts(
-        voice=config.tts.voice, speed=config.tts.speed, lang=config.tts.lang,
+        base_url=config.tts.base_url, voice=config.tts.voice,
+        max_seconds=config.tts.max_seconds, timeout=config.tts.timeout,
     )
     tts = tts if tts.load() else None
     if tts:
-        console.print(f"  ✓ TTS ({tts.backend_name}, {tts.voice})")
+        console.print(f"  ✓ TTS ({tts.backend_name} at {config.tts.base_url})")
     else:
         console.print("  ⚠ TTS unavailable")
 
@@ -353,9 +376,13 @@ def main():
     ).start()
 
     model_info = {
-        "stt": f"faster-whisper ({config.stt.model})",
+        "stt": (
+            f"faster-whisper ({config.stt.model}, display only)" if unified and stt
+            else f"faster-whisper ({config.stt.model})" if stt
+            else "none — audio goes to the model"
+        ),
         "vlm": llm.model,
-        "tts": f"{tts.backend_name} ({tts.voice})" if tts else "unavailable",
+        "tts": f"{tts.backend_name} ({tts.voice or 'default voice'})" if tts else "unavailable",
         "vad": "Silero",
     }
 
@@ -386,8 +413,6 @@ def main():
 
     n_frames = config.vision.frames
     n_fewshot = len(vision_few_shot) // 2
-    first_chunk_words = config.tts.first_chunk_words
-    max_chunk_words = config.tts.max_chunk_words
 
     console.print(
         f"\n[green bold]Ready — speak anytime! "
@@ -420,40 +445,58 @@ def main():
             )
             dt_cam = time.perf_counter() - t_cam
 
-            t_stt = time.perf_counter()
-            result = stt.transcribe(segment.audio, sample_rate=SAMPLE_RATE)
-            text = result.get("text", "").strip()
-            dt_stt = time.perf_counter() - t_stt
+            audio_b64 = None
+            text = ""
+            dt_stt = 0.0
 
-            if not text:
-                err = result.get("error", "")
-                console.print(
-                    f"[dim]  (not recognized — {segment.duration:.1f}s, "
-                    f"rms={segment.rms:.4f}{', err='+err if err else ''})[/dim]"
-                )
-                broadcaster.send({"type": "status", "stage": "listening"})
-                mic.resume()
-                continue
+            if unified:
+                audio_b64 = segment_to_wav_b64(segment.raw_chunks)
 
-            word_count = len(text.split())
-            if word_count <= 2 and "?" not in text:
-                console.print(f"[dim]  (skipped filler: \"{text}\")[/dim]")
-                broadcaster.send({"type": "status", "stage": "listening"})
-                mic.resume()
-                continue
+            if stt is not None:
+                t_stt = time.perf_counter()
+                result = stt.transcribe(segment.audio, sample_rate=SAMPLE_RATE)
+                text = result.get("text", "").strip()
+                dt_stt = time.perf_counter() - t_stt
+
+                if not text and not unified:
+                    err = result.get("error", "")
+                    console.print(
+                        f"[dim]  (not recognized — {segment.duration:.1f}s, "
+                        f"rms={segment.rms:.4f}{', err='+err if err else ''})[/dim]"
+                    )
+                    broadcaster.send({"type": "status", "stage": "listening"})
+                    mic.resume()
+                    continue
+
+                if not unified:
+                    word_count = len(text.split())
+                    if word_count <= 2 and "?" not in text:
+                        console.print(f"[dim]  (skipped filler: \"{text}\")[/dim]")
+                        broadcaster.send({"type": "status", "stage": "listening"})
+                        mic.resume()
+                        continue
+
+            prompt = AUDIO_PROMPT if unified else text
 
             n_imgs = len(captured_frames)
+            said = text if text else f"(spoken, {segment.duration:.1f}s)"
             console.print(
-                f'  [green]You:[/green] "{text}" '
+                f'  [green]You:[/green] "{said}" '
                 f'[dim]({n_imgs} frame{"s" if n_imgs != 1 else ""} captured)[/dim]'
             )
 
-            broadcaster.send({
+            # With no STT there is nothing to print, so the browser gets a chip
+            # saying how long the person spoke for instead of their words.
+            transcript_msg = {
                 "type": "transcript",
-                "text": text,
-                "stt_time": round(dt_stt, 2),
+                "text": text or "(spoken)",
                 "duration": round(segment.duration, 1),
-            })
+            }
+            if text:
+                transcript_msg["stt_time"] = round(dt_stt, 2)
+            else:
+                transcript_msg["audio"] = True
+            broadcaster.send(transcript_msg)
 
             # ── VLM streaming with TTS + WebSocket broadcast ─────
             broadcaster.send({"type": "status", "stage": "thinking"})
@@ -482,14 +525,14 @@ def main():
 
             full_resp = ""
             tts_buf = ""
-            first_tts_sent = False
             t_llm = time.perf_counter()
             ttft = None
 
             for chunk_data in llm.generate_stream(
-                prompt=text, system_prompt=vision_system_prompt,
+                prompt=prompt, system_prompt=vision_system_prompt,
                 images_b64=captured_frames if captured_frames else None,
                 few_shot=vision_few_shot if vision_few_shot else None,
+                audio_b64=audio_b64,
             ):
                 content, meta = chunk_data if isinstance(chunk_data, tuple) else (chunk_data, {})
                 if content:
@@ -504,19 +547,17 @@ def main():
 
                     if tts_q is not None:
                         tts_buf += content
-                        words = len(tts_buf.split())
-                        limit = first_chunk_words if not first_tts_sent else max_chunk_words
-                        hit_break = any(c in content for c in TTS_BREAKS) and words >= 2
-                        if hit_break or words >= limit:
-                            tts_q.put(tts_buf.strip())
-                            tts_buf = ""
-                            first_tts_sent = True
+                        sentences, tts_buf = split_sentences(tts_buf)
+                        for sentence in sentences:
+                            if is_speakable(sentence):
+                                tts_q.put(sentence)
 
             dt_llm = time.perf_counter() - t_llm
 
             if tts_q is not None:
-                if tts_buf.strip():
-                    tts_q.put(tts_buf.strip())
+                tail = tts_buf.strip()
+                if tail and is_speakable(tail):
+                    tts_q.put(tail)
                 tts_q.put(None)
                 tts_thread.join()
 
@@ -524,7 +565,8 @@ def main():
 
             toks = len(full_resp.split())
             stability = "stable" if stable_at_capture else "latest"
-            timing = f"  [dim]STT {dt_stt:.1f}s | CAM {dt_cam*1000:.0f}ms ({n_imgs} {stability} img)"
+            heard = f"STT {dt_stt:.1f}s" if stt is not None else "audio direct"
+            timing = f"  [dim]{heard} | CAM {dt_cam*1000:.0f}ms ({n_imgs} {stability} img)"
             if ttft is not None:
                 timing += f" | TTFT {ttft:.1f}s | VLM {dt_llm:.1f}s ~{toks/(dt_llm or 1):.0f}w/s"
             else:

@@ -13,6 +13,10 @@
  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  See the License for the specific language governing permissions and
  limitations under the License.
+
+ Modified by the reachy-mini-gguf-assistant contributors, 2026:
+ the transcript line copes with there being no transcript, because in unified
+ mode the model hears the microphone itself and no speech-to-text runs.
 -->
 
 <!DOCTYPE html>
@@ -482,8 +486,14 @@ footer{display:flex;align-items:center;gap:14px;padding:5px 20px;background:var(
     hideEmpty();
     const div = document.createElement('div');
     div.className = 'msg user';
-    div.innerHTML = `<div class="content">${esc(msg.text)}</div>`
-      + `<div class="meta">${msg.stt_time ? 'STT '+msg.stt_time.toFixed(1)+'s' : ''}`
+    /* No speech-to-text means there are no words to show \u2014 the model hears the
+       audio itself. Say that, with how long the person spoke for. */
+    const spoken = msg.audio === true;
+    div.innerHTML = (spoken
+        ? `<div class="content" style="opacity:.75;font-style:italic">\u{1F3A4} spoken</div>`
+        : `<div class="content">${esc(msg.text)}</div>`)
+      + `<div class="meta">${msg.stt_time ? 'STT '+msg.stt_time.toFixed(1)+'s'
+                                          : (spoken ? 'heard directly' : '')}`
       + `${msg.duration ? ' \u00b7 '+msg.duration.toFixed(1)+'s' : ''}</div>`;
     $('messages').appendChild(div);
     scrollChat();

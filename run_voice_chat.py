@@ -13,13 +13,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified by the reachy-mini-gguf-assistant contributors, 2026:
+# unified mode sends the utterance itself to the model and never loads
+# faster-whisper; speech comes from llama-tts-server.
 
 """
 Voice Chat — speak anytime, dynamic recording.
-Mic -> Silero VAD -> STT -> (RAG) -> LLM stream -> TTS stream -> Speaker
+
+  unified (default):  Mic -> Silero VAD -> Gemma (hears the audio) -> TTS -> Speaker
+  split:              Mic -> Silero VAD -> STT -> (RAG) -> LLM -> TTS -> Speaker
+
+RAG needs a transcript, so it only applies in split mode.
 
 Usage:
-  python3 run_voice_chat.py            # with RAG
+  python3 run_voice_chat.py            # with RAG (split mode only)
   python3 run_voice_chat.py --no-rag   # without RAG
 """
 
@@ -31,11 +39,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from app.config import Config
 from app.audio import find_alsa_device
-from app.stt import STT
 from app.llm import LLM
-from app.tts import create_tts
+from app.tts_client import create_tts
 from app.pipeline import (
-    SAMPLE_RATE, MicRecorder, warmup_stt, vad_loop, stream_and_speak, load_silero,
+    AUDIO_PROMPT, SAMPLE_RATE, MicRecorder, warmup_stt, vad_loop,
+    segment_to_wav_b64, stream_and_speak, load_silero,
 )
 from rich.console import Console
 from rich.panel import Panel
@@ -44,14 +52,17 @@ console = Console()
 
 
 def main():
-    use_rag = "--no-rag" not in sys.argv
     config = Config.load()
+    unified = (config.pipeline.mode or "unified").lower() != "split"
+    # Retrieval needs words to search with, and in unified mode there are none.
+    use_rag = "--no-rag" not in sys.argv and not unified
     active_system_prompt = config.llm.system_prompt if use_rag else config.llm.system_prompt_no_rag
 
     console.print(Panel.fit(
         "[bold cyan]Voice Chat[/bold cyan]\n"
         "Speak anytime — auto-detects speech\n"
-        f"[dim]{'RAG on' if use_rag else 'RAG off'}  |  Ctrl-C to quit[/dim]",
+        f"[dim]{'audio straight to the model' if unified else 'STT + LLM (split)'}"
+        f"  |  {'RAG on' if use_rag else 'RAG off'}  |  Ctrl-C to quit[/dim]",
         border_style="cyan",
     ))
 
@@ -67,15 +78,20 @@ def main():
     # ── Load models ──────────────────────────────────────────────
     console.print("\n[bold]Loading...[/bold]")
 
-    stt = STT(
-        model=config.stt.model, device=config.stt.device,
-        compute_type=config.stt.compute_type, language=config.stt.language,
-        beam_size=config.stt.beam_size,
-    )
-    stt.load()
-    console.print(f"  ✓ STT (faster-whisper, {config.stt.model})")
-    console.print("    CUDA warmup...", end=" ")
-    console.print(f"done ({warmup_stt(stt):.1f}s)")
+    stt = None
+    if not unified:
+        from app.stt import STT
+        stt = STT(
+            model=config.stt.model, device=config.stt.device,
+            compute_type=config.stt.compute_type, language=config.stt.language,
+            beam_size=config.stt.beam_size,
+        )
+        stt.load()
+        console.print(f"  ✓ STT (faster-whisper, {config.stt.model})")
+        console.print("    CUDA warmup...", end=" ")
+        console.print(f"done ({warmup_stt(stt):.1f}s)")
+    else:
+        console.print("  ✓ No STT — the model hears the microphone itself")
 
     silero_model = load_silero(console)
 
@@ -89,11 +105,12 @@ def main():
     console.print(f"  ✓ LLM ({llm.model})")
 
     tts = create_tts(
-        voice=config.tts.voice, speed=config.tts.speed, lang=config.tts.lang,
+        base_url=config.tts.base_url, voice=config.tts.voice,
+        max_seconds=config.tts.max_seconds, timeout=config.tts.timeout,
     )
     tts = tts if tts.load() else None
     if tts:
-        console.print(f"  ✓ TTS ({tts.backend_name}, {tts.voice})")
+        console.print(f"  ✓ TTS ({tts.backend_name} at {config.tts.base_url})")
     else:
         console.print("  ⚠ TTS unavailable")
 
@@ -128,21 +145,29 @@ def main():
     # ── Main loop ────────────────────────────────────────────────
     try:
         for segment in vad_loop(mic, console, vad_cfg=config.vad, silero=silero_model):
-            t_stt = time.perf_counter()
-            result = stt.transcribe(segment.audio, sample_rate=SAMPLE_RATE)
-            text = result.get("text", "").strip()
-            dt_stt = time.perf_counter() - t_stt
+            audio_b64 = None
+            dt_stt = 0.0
 
-            if not text:
-                err = result.get("error", "")
-                console.print(
-                    f"[dim]  (not recognized — {segment.duration:.1f}s, "
-                    f"rms={segment.rms:.4f}{', err='+err if err else ''})[/dim]"
-                )
-                mic.resume()
-                continue
+            if unified:
+                audio_b64 = segment_to_wav_b64(segment.raw_chunks)
+                text = AUDIO_PROMPT
+                console.print(f"  [green]You:[/green] [dim](spoken, {segment.duration:.1f}s)[/dim]")
+            else:
+                t_stt = time.perf_counter()
+                result = stt.transcribe(segment.audio, sample_rate=SAMPLE_RATE)
+                text = result.get("text", "").strip()
+                dt_stt = time.perf_counter() - t_stt
 
-            console.print(f'  [green]You:[/green] "{text}"')
+                if not text:
+                    err = result.get("error", "")
+                    console.print(
+                        f"[dim]  (not recognized — {segment.duration:.1f}s, "
+                        f"rms={segment.rms:.4f}{', err='+err if err else ''})[/dim]"
+                    )
+                    mic.resume()
+                    continue
+
+                console.print(f'  [green]You:[/green] "{text}"')
 
             prompt = text
             dt_rag = 0.0
@@ -169,12 +194,11 @@ def main():
 
             full_resp, dt_llm, ttft = stream_and_speak(
                 llm, tts, prompt, active_system_prompt, mic.pa_sink,
-                first_chunk_words=config.tts.first_chunk_words,
-                max_chunk_words=config.tts.max_chunk_words,
+                audio_b64=audio_b64,
             )
             console.print()
 
-            timing = f"  [dim]STT {dt_stt:.1f}s"
+            timing = "  [dim]audio direct" if unified else f"  [dim]STT {dt_stt:.1f}s"
             if rag:
                 timing += f" | RAG {dt_rag:.1f}s"
             if ttft is not None:
@@ -191,7 +215,8 @@ def main():
         console.print("\n[yellow]Goodbye![/yellow]")
     finally:
         mic.stop()
-        stt.unload()
+        if stt:
+            stt.unload()
         llm.unload()
         if tts:
             tts.unload()

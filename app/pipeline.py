@@ -12,6 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified by the reachy-mini-gguf-assistant contributors, 2026:
+# segment_to_wav_b64() turns a captured utterance into a base64 WAV for the
+# model; tts_player() synthesises one sentence ahead of playback; text is cut
+# into sentences rather than 3- and 8-word chunks. The gesture callbacks are
+# unchanged: on_audio_start still fires on the first chunk that is actually
+# played, on_audio_end still fires once in the finally.
 
 """Pipeline — shared audio I/O, VAD, TTS streaming, and mic recording.
 
@@ -19,6 +26,8 @@ Extracts the common infrastructure used by both run_voice_chat.py and
 run_vision_chat.py so each entry point only contains its unique logic.
 """
 
+import base64
+import io
 import sys
 import time
 import wave
@@ -35,6 +44,7 @@ from rich.console import Console
 
 from app.audio import kill_pulseaudio
 from app.config import VADConfig
+from app.sentence_split import is_speakable, split_sentences
 
 # Suppress noisy ALSA error messages (underrun warnings etc.)
 # The callback reference must be kept alive to avoid segfault from GC.
@@ -56,7 +66,10 @@ SAMPLE_RATE = 16000
 SILERO_CHUNK_SAMPLES = 512  # Silero VAD requires exactly 512 samples (32ms) at 16kHz
 CHANNELS = 1
 
-TTS_BREAKS = frozenset('.,;:!?\n')
+# What the model is told alongside the raw utterance in unified mode. The
+# audio is the question; this is only there because a chat turn wants text.
+AUDIO_PROMPT = "The user just said this out loud. Answer them."
+
 AEC_SOURCE_NAME = "reachy_aec_source"
 AEC_SINK_NAME = "reachy_aec_sink"
 
@@ -74,6 +87,22 @@ def save_wav(chunks: list[bytes], path: str):
         wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(b"".join(chunks))
+
+
+def segment_to_wav_b64(chunks: list) -> str:
+    """Wrap captured mic chunks in a WAV header and base64 it for the model.
+
+    Same format as save_wav (16 kHz, mono, signed 16-bit) but into memory: the
+    utterance goes straight into the chat request as an input_audio part, so it
+    never touches the disk.
+    """
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(b"".join(chunks))
+    return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def warmup_stt(stt_obj) -> float:
@@ -356,6 +385,9 @@ def play_audio(audio: np.ndarray, sample_rate: int, sink: Optional[str] = None):
                 time.sleep(remaining)
 
 
+_PLAY_STOP = object()
+
+
 def tts_player(
     tts_obj,
     tts_q: queue.Queue,
@@ -363,24 +395,58 @@ def tts_player(
     on_audio_start: Optional[Callable[[], None]] = None,
     on_audio_end: Optional[Callable[[], None]] = None,
 ):
-    """Synthesize queued text and expose the true first/last audio events."""
+    """Synthesize queued text and expose the true first/last audio events.
+
+    Synthesis runs one sentence ahead of playback: while sentence one is being
+    spoken out loud, sentence two is already being made. play_audio() blocks for
+    the real duration of the audio, which used to be dead time for the speech
+    server. Requests stay strictly one at a time — llama-tts-server holds a
+    single mutex, so there is nothing to gain from firing them in parallel — and
+    playback stays in the order the sentences arrived.
+
+    The callback contract is unchanged and load-bearing for the robot's
+    gestures: on_audio_start fires once, on the first chunk that is actually
+    played (not the first one synthesized), and on_audio_end fires once in the
+    finally. tests/test_tts_player_callbacks.py pins this.
+    """
+    play_q: queue.Queue = queue.Queue()
+
+    def synth_worker():
+        try:
+            while True:
+                text = tts_q.get()
+                if text is None:
+                    return
+                try:
+                    r = tts_obj.synthesize(text)
+                except Exception as exc:
+                    print(f"TTS synthesis failed: {exc}")
+                    continue
+                if r.get("audio") is not None:
+                    play_q.put(r)
+                elif r.get("error"):
+                    print(f"TTS: {r['error']}")
+        finally:
+            play_q.put(_PLAY_STOP)
+
+    synth = threading.Thread(target=synth_worker, daemon=True, name="tts-synth")
+    synth.start()
+
     audio_started = False
     try:
         while True:
-            text = tts_q.get()
-            if text is None:
+            item = play_q.get()
+            if item is _PLAY_STOP:
                 return
-            r = tts_obj.synthesize(text)
-            if r.get("audio") is not None:
-                if not audio_started:
-                    audio_started = True
-                    if on_audio_start:
-                        try:
-                            on_audio_start()
-                        except Exception as exc:
-                            print(f"TTS start callback failed: {exc}")
-                current_sink = sink() if callable(sink) else sink
-                play_audio(r["audio"], r["sample_rate"], sink=current_sink)
+            if not audio_started:
+                audio_started = True
+                if on_audio_start:
+                    try:
+                        on_audio_start()
+                    except Exception as exc:
+                        print(f"TTS start callback failed: {exc}")
+            current_sink = sink() if callable(sink) else sink
+            play_audio(item["audio"], item["sample_rate"], sink=current_sink)
     finally:
         if audio_started and on_audio_end:
             try:
@@ -781,12 +847,17 @@ def stream_and_speak(
     prompt: str,
     system_prompt: str,
     pa_sink: Optional[str] = None,
-    images_b64: Optional[list[str]] = None,
-    few_shot: Optional[list[dict]] = None,
-    first_chunk_words: int = 3,
-    max_chunk_words: int = 8,
-) -> tuple[str, float, Optional[float]]:
-    """Stream LLM response while chunking text to TTS for real-time playback.
+    images_b64: Optional[list] = None,
+    few_shot: Optional[list] = None,
+    audio_b64: Optional[str] = None,
+) -> tuple:
+    """Stream the reply, speaking each finished sentence as it lands.
+
+    Sentences, not word counts: Pocket TTS carries prosody across a whole
+    sentence, and cutting at 8 words made the voice sound stitched together.
+    The first sentence is usually short enough that speech still starts early.
+
+    Pass audio_b64 to let the model hear the question itself.
 
     Returns (full_response, elapsed_seconds, time_to_first_token).
     """
@@ -801,13 +872,12 @@ def stream_and_speak(
 
     full_resp = ""
     tts_buf = ""
-    first_tts_sent = False
     t_llm = time.perf_counter()
     ttft = None
 
     for chunk_data in llm.generate_stream(
         prompt=prompt, system_prompt=system_prompt,
-        images_b64=images_b64, few_shot=few_shot,
+        images_b64=images_b64, few_shot=few_shot, audio_b64=audio_b64,
     ):
         content, meta = chunk_data if isinstance(chunk_data, tuple) else (chunk_data, {})
         if content:
@@ -819,19 +889,17 @@ def stream_and_speak(
 
             if tts_q is not None:
                 tts_buf += content
-                words = len(tts_buf.split())
-                limit = first_chunk_words if not first_tts_sent else max_chunk_words
-                hit_break = any(c in content for c in TTS_BREAKS) and words >= 2
-                if hit_break or words >= limit:
-                    tts_q.put(tts_buf.strip())
-                    tts_buf = ""
-                    first_tts_sent = True
+                sentences, tts_buf = split_sentences(tts_buf)
+                for sentence in sentences:
+                    if is_speakable(sentence):
+                        tts_q.put(sentence)
 
     dt_llm = time.perf_counter() - t_llm
 
     if tts_q is not None:
-        if tts_buf.strip():
-            tts_q.put(tts_buf.strip())
+        tail = tts_buf.strip()
+        if tail and is_speakable(tail):
+            tts_q.put(tail)
         tts_q.put(None)
         tts_thread.join()
 

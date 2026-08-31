@@ -12,8 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified by the reachy-mini-gguf-assistant contributors, 2026:
+# generate_stream() takes audio_b64 and sends it as an OpenAI "input_audio"
+# content part, so microphone audio reaches the model directly and no
+# speech-to-text stage is needed.
 
-"""LLM — Ollama or OpenAI-compatible backend (llama.cpp)."""
+"""LLM — Ollama or OpenAI-compatible backend (llama.cpp).
+
+The OpenAI path is the one this fork uses: a single llama-server holding
+Gemma 4 E2B with an mmproj that handles both images and audio. One user turn
+can carry text, camera frames and the raw utterance in the same request.
+"""
 
 import httpx
 import json
@@ -81,18 +91,30 @@ class LLM:
         return msgs
 
     def _messages_multimodal(
-        self, prompt: str, images_b64: list[str],
+        self, prompt: str, images_b64: Optional[list] = None,
         system_prompt: Optional[str] = None,
-        few_shot: Optional[list[dict]] = None,
+        few_shot: Optional[list] = None,
+        audio_b64: Optional[str] = None,
     ) -> list:
+        """Build one user turn out of text, camera frames and spoken audio.
+
+        The audio part comes first among the attachments: the utterance is the
+        question, and the image is context the model was told to ignore unless
+        it is asked about what it sees.
+        """
         msgs = []
         sp = system_prompt or self.system_prompt
         if sp:
             msgs.append({"role": "system", "content": sp})
         if few_shot:
             msgs.extend(few_shot)
-        content: list[dict] = [{"type": "text", "text": prompt}]
-        for b64 in images_b64:
+        content = [{"type": "text", "text": prompt}]
+        if audio_b64:
+            content.append({
+                "type": "input_audio",
+                "input_audio": {"data": audio_b64, "format": "wav"},
+            })
+        for b64 in images_b64 or []:
             content.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
@@ -106,17 +128,24 @@ class LLM:
         system_prompt: Optional[str] = None,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
-        images_b64: Optional[list[str]] = None,
-        few_shot: Optional[list[dict]] = None,
+        images_b64: Optional[list] = None,
+        few_shot: Optional[list] = None,
+        audio_b64: Optional[str] = None,
     ) -> Iterator[tuple]:
-        """Yields (content, metadata) tuples. Pass images_b64 for multimodal VLM requests."""
+        """Yields (content, metadata) tuples.
+
+        Pass images_b64 for camera frames and audio_b64 for a base64 WAV of the
+        user's utterance; either, both or neither.
+        """
         if not self._loaded:
             yield ("", {})
             return
         mt = max_tokens or self.max_tokens
         t = temperature if temperature is not None else self.temperature
-        if images_b64:
-            msgs = self._messages_multimodal(prompt, images_b64, system_prompt, few_shot)
+        if images_b64 or audio_b64:
+            msgs = self._messages_multimodal(
+                prompt, images_b64, system_prompt, few_shot, audio_b64=audio_b64,
+            )
         else:
             msgs = self._messages(prompt, system_prompt, few_shot)
 

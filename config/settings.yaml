@@ -13,11 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Reachy Mini Jetson Assistant — Configuration
+#
+# Modified by the reachy-mini-gguf-assistant contributors, 2026:
+# new pipeline section, tts now points at llama-tts-server, stt is split-mode
+# only, RAG off by default.
+
+# Reachy Mini GGUF Assistant — Configuration
+
+pipeline:
+  mode: "unified"                     # "unified" = mic audio goes straight to Gemma (no STT)
+                                      # "split"   = faster-whisper STT + separate VLM (the A/B)
+  transcribe_for_display: false       # true runs Whisper as well, only to show the words in
+                                      # the web UI. Costs a second model, and in unified mode
+                                      # a second llama-server slot (start it with -np 2).
 
 llm:
   model: ""                           # empty = auto-detect from server
-  base_url: "http://localhost:8080"
+  base_url: "http://127.0.0.1:8080"   # llama-server holding Gemma 4 E2B + its mmproj
   backend: "openai"                   # "openai" (llama.cpp) or "ollama"
   max_tokens: 128
   temperature: 0.7
@@ -39,7 +51,7 @@ llm:
     Never use emojis, asterisks, bullet points, markdown, code blocks, or special formatting.
     Write numbers and units as spoken words when short.
 
-stt:
+stt:                                  # split mode only — unified mode never loads this
   model: "small.en"                   # tiny.en, base.en, small.en
   device: "cuda"
   compute_type: "int8"
@@ -47,11 +59,11 @@ stt:
   beam_size: 1                        # 1=greedy (fast), 5=beam (quality)
 
 tts:
-  voice: "af_sarah"                   # kokoro voices: af_sarah, af_bella, am_adam, bf_emma, bm_george, etc.
-  speed: 1.0
-  lang: "en-us"                       # kokoro language code
-  first_chunk_words: 3                # words before first TTS chunk is sent
-  max_chunk_words: 8                  # max words per TTS chunk
+  base_url: "http://127.0.0.1:8100"   # llama-tts-server holding Pocket TTS
+  voice: ""                           # empty = the reference voice the server was started with;
+                                      # a name from GET /v1/audio/voices otherwise
+  max_seconds: 30.0                   # runaway cap, scaled down per sentence
+  timeout: 300.0                      # first synthesis on a cold CPU server is slow
 
 audio:
   sample_rate: 16000
@@ -78,9 +90,9 @@ vision:
   jpeg_quality: 80                    # JPEG compression (lower = smaller payload)
   frames: 1                           # max frames to send per utterance
   capture_fps: 10.0                   # shared camera capture rate (frames/sec)
+  vlm_base_url: ""                    # split mode only; empty = use llm.base_url
   system_prompt: |
     You are Reachy Mini, a friendly robot made by Pollen Robotics, running on an NVIDIA Jetson Orin Nano.
-    You use the Cosmos Reason2 vision-language model for understanding what you see.
     An image is always attached. Only use the image when the user asks about what you see, colors, objects, or the scene.
     Otherwise ignore the image completely and respond naturally.
     Answer in one short sentence. No markdown or formatting.
@@ -148,7 +160,9 @@ web:
   port: 8090
 
 rag:
-  enabled: true
+  enabled: false                      # a third model does not fit next to Gemma and Pocket TTS
+                                      # on an 8 GB board; point embedding_base_url somewhere
+                                      # with room and set this true if you want it
   knowledge_dir: "./knowledge_base"
   persist_dir: "./data/chromadb"
   embedding_backend: "llamacpp"       # "llamacpp" (GPU), "ollama", or "local"

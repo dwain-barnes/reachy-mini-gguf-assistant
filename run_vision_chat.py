@@ -13,10 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified by the reachy-mini-gguf-assistant contributors, 2026:
+# unified mode sends the utterance itself to the model alongside the camera
+# frames and never loads faster-whisper; speech comes from llama-tts-server.
 
 """
-Vision Chat — speak + see, the VLM describes what it sees.
-Mic -> Silero VAD -> [camera capture] -> STT -> VLM (text + images) -> TTS -> Speaker
+Vision Chat — speak + see, one model does both.
+
+  unified (default):  Mic -> VAD -> [camera] -> Gemma (audio + images) -> TTS -> Speaker
+  split:              Mic -> VAD -> [camera] -> STT -> VLM (text + images) -> TTS -> Speaker
 
 Usage:
   python3 run_vision_chat.py
@@ -33,12 +39,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from app.config import Config
 from app.audio import find_alsa_device
-from app.stt import STT
 from app.llm import LLM
-from app.tts import create_tts
+from app.tts_client import create_tts
 from app.camera import Camera
 from app.pipeline import (
-    SAMPLE_RATE, MicRecorder, warmup_stt, vad_loop, stream_and_speak, load_silero,
+    AUDIO_PROMPT, SAMPLE_RATE, MicRecorder, warmup_stt, vad_loop,
+    segment_to_wav_b64, stream_and_speak, load_silero,
 )
 from app.reachy import kill_stale_camera_holders, connect as connect_reachy
 from app.face_detector import FaceDetector
@@ -53,11 +59,13 @@ console = Console()
 
 def main():
     config = Config.load()
+    unified = (config.pipeline.mode or "unified").lower() != "split"
 
     console.print(Panel.fit(
         "[bold cyan]Vision Chat[/bold cyan]\n"
         "Speak anytime — camera captures when you speak\n"
-        "[dim]Ctrl-C to quit[/dim]",
+        f"[dim]{'audio straight to the model' if unified else 'STT + VLM (split)'}"
+        "  |  Ctrl-C to quit[/dim]",
         border_style="cyan",
     ))
 
@@ -138,22 +146,29 @@ def main():
     # ── Load models ──────────────────────────────────────────────
     console.print("\n[bold]Loading...[/bold]")
 
-    stt = STT(
-        model=config.stt.model, device=config.stt.device,
-        compute_type=config.stt.compute_type, language=config.stt.language,
-        beam_size=config.stt.beam_size,
-    )
-    stt.load()
-    console.print(f"  ✓ STT (faster-whisper, {config.stt.model})")
-    console.print("    CUDA warmup...", end=" ")
-    console.print(f"done ({warmup_stt(stt):.1f}s)")
+    stt = None
+    if not unified:
+        from app.stt import STT
+        stt = STT(
+            model=config.stt.model, device=config.stt.device,
+            compute_type=config.stt.compute_type, language=config.stt.language,
+            beam_size=config.stt.beam_size,
+        )
+        stt.load()
+        console.print(f"  ✓ STT (faster-whisper, {config.stt.model})")
+        console.print("    CUDA warmup...", end=" ")
+        console.print(f"done ({warmup_stt(stt):.1f}s)")
+    else:
+        console.print("  ✓ No STT — the model hears the microphone itself")
 
     silero_model = load_silero(console)
 
     vision_system_prompt = config.vision.system_prompt
     vision_few_shot = config.vision.few_shot or []
     llm = LLM(
-        model=config.llm.model, base_url=config.llm.base_url,
+        model=config.llm.model,
+        base_url=(config.vision.vlm_base_url or config.llm.base_url) if not unified
+                 else config.llm.base_url,
         backend=config.llm.backend, max_tokens=config.llm.max_tokens,
         temperature=config.llm.temperature, timeout=config.llm.timeout,
         system_prompt=vision_system_prompt,
@@ -162,11 +177,12 @@ def main():
     console.print(f"  ✓ VLM ({llm.model})")
 
     tts = create_tts(
-        voice=config.tts.voice, speed=config.tts.speed, lang=config.tts.lang,
+        base_url=config.tts.base_url, voice=config.tts.voice,
+        max_seconds=config.tts.max_seconds, timeout=config.tts.timeout,
     )
     tts = tts if tts.load() else None
     if tts:
-        console.print(f"  ✓ TTS ({tts.backend_name}, {tts.voice})")
+        console.print(f"  ✓ TTS ({tts.backend_name} at {config.tts.base_url})")
     else:
         console.print("  ⚠ TTS unavailable")
 
@@ -246,29 +262,37 @@ def main():
             )
             dt_cam = time.perf_counter() - t_cam
 
-            t_stt = time.perf_counter()
-            result = stt.transcribe(segment.audio, sample_rate=SAMPLE_RATE)
-            text = result.get("text", "").strip()
-            dt_stt = time.perf_counter() - t_stt
+            audio_b64 = None
+            dt_stt = 0.0
 
-            if not text:
-                err = result.get("error", "")
-                console.print(
-                    f"[dim]  (not recognized — {segment.duration:.1f}s, "
-                    f"rms={segment.rms:.4f}{', err='+err if err else ''})[/dim]"
-                )
-                mic.resume()
-                continue
+            if unified:
+                audio_b64 = segment_to_wav_b64(segment.raw_chunks)
+                text = AUDIO_PROMPT
+            else:
+                t_stt = time.perf_counter()
+                result = stt.transcribe(segment.audio, sample_rate=SAMPLE_RATE)
+                text = result.get("text", "").strip()
+                dt_stt = time.perf_counter() - t_stt
 
-            word_count = len(text.split())
-            if word_count <= 2 and "?" not in text:
-                console.print(f"[dim]  (skipped filler: \"{text}\")[/dim]")
-                mic.resume()
-                continue
+                if not text:
+                    err = result.get("error", "")
+                    console.print(
+                        f"[dim]  (not recognized — {segment.duration:.1f}s, "
+                        f"rms={segment.rms:.4f}{', err='+err if err else ''})[/dim]"
+                    )
+                    mic.resume()
+                    continue
+
+                word_count = len(text.split())
+                if word_count <= 2 and "?" not in text:
+                    console.print(f"[dim]  (skipped filler: \"{text}\")[/dim]")
+                    mic.resume()
+                    continue
 
             n_imgs = len(captured_frames)
+            said = f"(spoken, {segment.duration:.1f}s)" if unified else f'"{text}"'
             console.print(
-                f'  [green]You:[/green] "{text}" '
+                f'  [green]You:[/green] {said} '
                 f'[dim]({n_imgs} frame{"s" if n_imgs != 1 else ""} captured)[/dim]'
             )
 
@@ -279,13 +303,13 @@ def main():
                 llm, tts, text, vision_system_prompt, mic.pa_sink,
                 images_b64=captured_frames if captured_frames else None,
                 few_shot=vision_few_shot if vision_few_shot else None,
-                first_chunk_words=config.tts.first_chunk_words,
-                max_chunk_words=config.tts.max_chunk_words,
+                audio_b64=audio_b64,
             )
             console.print()
 
             stability = "stable" if stable_at_capture else "latest"
-            timing = f"  [dim]STT {dt_stt:.1f}s | CAM {dt_cam*1000:.0f}ms ({n_imgs} {stability} img)"
+            heard = "audio direct" if unified else f"STT {dt_stt:.1f}s"
+            timing = f"  [dim]{heard} | CAM {dt_cam*1000:.0f}ms ({n_imgs} {stability} img)"
             if ttft is not None:
                 toks = len(full_resp.split())
                 timing += f" | TTFT {ttft:.1f}s | VLM {dt_llm:.1f}s ~{toks/(dt_llm or 1):.0f}w/s"
