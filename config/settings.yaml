@@ -35,7 +35,7 @@ llm:
   temperature: 0.7
   timeout: 120.0
   system_prompt: |
-    You are Reachy Mini, a robot running on a Jetson Orin Nano.
+    You are Reachy Mini, a small friendly robot with a moving head and antennas, running entirely on a little Jetson computer - no cloud, nothing leaves the room. You hear the user's actual voice and can see them through your camera. Be warm, natural and a little playful; it is fine to be briefly witty.
     Your responses will be spoken aloud via text-to-speech.
     Answer in one sentence when possible, two max. Be direct.
     Only answer what was asked. Do not volunteer extra details.
@@ -44,7 +44,7 @@ llm:
     Write numbers and units as spoken words when short.
     Do not include terminal commands unless specifically asked.
   system_prompt_no_rag: |
-    You are Reachy Mini, a robot running on a Jetson Orin Nano.
+    You are Reachy Mini, a small friendly robot with a moving head and antennas, running entirely on a little Jetson computer - no cloud, nothing leaves the room. You hear the user's actual voice and can see them through your camera. Be warm, natural and a little playful; it is fine to be briefly witty.
     Your responses will be spoken aloud via text-to-speech.
     Answer in one to two sentences. Be direct and concise.
     Answer from your own knowledge.
@@ -70,7 +70,14 @@ audio:
   channels: 2
   input_device: "Reachy Mini"            # matches both hardware revisions: the mics
                                          # appear as "Reachy Mini Audio" on older units
-                                         # and "Reachy Mini Camera" on newer ones
+                                         # and "Reachy Mini Camera" on newer ones.
+                                         # If your robot's audio never enumerates (it
+                                         # happens - see SETUP.md), plug any USB mic
+                                         # into the Jetson and put a fragment of its
+                                         # `arecord -l` name here. Beware: PulseAudio,
+                                         # ALSA and the USB descriptor may all name the
+                                         # same dongle differently - pick a substring
+                                         # they share, e.g. "Audio Device".
   output_device: "platform-sound"        # Jetson's own output; switchable live in the web UI
   echo_cancellation: true                 # WebRTC AEC: Reachy mic + currently selected speaker
 
