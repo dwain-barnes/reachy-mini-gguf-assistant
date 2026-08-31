@@ -194,9 +194,19 @@ if [ ${#MISSING[@]} -eq 0 ]; then
     ok "all apt packages already installed"
 else
     info "installing: ${MISSING[*]}"
-    sudo apt-get update
-    sudo apt-get install -y "${MISSING[@]}"
-    ok "apt packages installed"
+    # A terminal gets the normal sudo prompt; a headless/scripted run (no tty)
+    # cannot answer one, so fail with the exact command instead of a cryptic
+    # sudo abort.
+    if [ -t 0 ] || sudo -n true 2>/dev/null; then
+        sudo apt-get update
+        sudo apt-get install -y "${MISSING[@]}"
+        ok "apt packages installed"
+    else
+        warn "cannot ask for a sudo password without a terminal."
+        warn "run this once, then re-run ./setup.sh:"
+        warn "    sudo apt-get install -y ${MISSING[*]}"
+        exit 1
+    fi
 fi
 
 if ! python3 -c 'import huggingface_hub' >/dev/null 2>&1; then
