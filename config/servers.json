@@ -1,0 +1,24 @@
+{
+  "_comment": "Template. setup.sh writes the real one to config/servers.local.json with the paths it resolved; edit that, not this. Ports here must match config/settings.yaml: llm.base_url uses llmPort, tts.base_url uses ttsPort, web.port is the browser UI.",
+  "llmPort": 8080,
+  "ttsPort": 8100,
+  "webUiPort": 8090,
+  "contextSize": 2048,
+  "llmGpuLayers": 99,
+  "ttsOnGpu": true,
+  "ttsGpuLayers": 99,
+  "ttsThreads": 4,
+  "llamaCommit": "9f0d017",
+  "quant": "UD-Q2_K_XL",
+  "bin": {
+    "llamaServer": "",
+    "llamaTtsServer": ""
+  },
+  "models": {
+    "llm": "",
+    "llmMmproj": "",
+    "tts": "",
+    "ttsMmproj": "",
+    "voice": ""
+  }
+}

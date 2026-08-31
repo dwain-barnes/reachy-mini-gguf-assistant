@@ -65,3 +65,9 @@ temp/
 .coverage
 coverage.xml
 htmlcov/
+
+# Fork additions
+llama.cpp/
+logs/
+config/servers.local.json
+llama-tts-server.patch

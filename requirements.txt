@@ -1,5 +1,9 @@
-# Reachy Mini Jetson Assistant
+# Reachy Mini GGUF Assistant
 # Tested on: Jetson Orin Nano 8GB, JetPack 6, Python 3.10
+#
+# Modified by the reachy-mini-gguf-assistant contributors, 2026:
+# faster-whisper and kokoro-onnx moved out of the default install - the two
+# GGUF models on llama.cpp replace them. ChromaDB likewise: RAG is off.
 
 # Core
 pyyaml>=6.0
@@ -13,27 +17,23 @@ sounddevice>=0.4.6
 # VAD — Silero neural voice activity detection (much better than energy-only)
 silero-vad>=5.1
 
-# LLM client (OpenAI-compatible API)
+# LLM and TTS clients — both servers speak HTTP
 httpx>=0.24.0
-
-# STT — faster-whisper (requires CTranslate2 with CUDA, see README)
-faster-whisper>=1.0.0
-
-# TTS — Kokoro (GPU via ONNX Runtime, runs in subprocess for GPL isolation)
-kokoro-onnx>=0.4.0
 
 # Face tracking — YuNet face detection via OpenCV (cv2.FaceDetectorYN)
 # No extra pip dependencies; uses opencv already listed
 
-# Vision — camera capture for VLM
+# Vision — camera capture
 opencv-python-headless>=4.8.0
-
-# RAG — vector store + embeddings
-chromadb>=0.4.0
 
 # Web UI (optional — only needed for run_web_vision_chat.py)
 fastapi>=0.109.1  # excludes Content-Type header ReDoS-affected releases
 uvicorn>=0.24.0
+
+# Optional — only for pipeline.mode "split", or transcribe_for_display:
+#   pip install faster-whisper
+# Optional — only for rag.enabled (needs an embedding server of your own):
+#   pip install chromadb
 
 # Reachy Mini SDK (robot control)
 # Installed separately: pip install reachy-mini
