@@ -88,9 +88,15 @@ Honest position, as of this commit:
   callback contract the gestures hang off — `on_audio_start` on the first chunk
   actually played, `on_audio_end` at the end — is pinned by tests, which is not
   the same as having watched the robot do it.
-- **Vision under a Q2 quant is untested.** `pipeline.mode: "split"` is kept as
-  the A/B: it puts faster-whisper and a separate VLM back in the path so the
-  two can be compared on the same board.
+- **Phase 2, vision: verified on real hardware.** Real USB-camera frames
+  through the fork's own module on the Orin: "what do you see" answered
+  sensibly from a live frame (2.2 s); a **spoken** question plus a frame in one
+  message - the full ears-plus-eyes turn - answered correctly (1.6 s); and the
+  distractor test passed: with a frame attached and a maths question asked, the
+  model answered "12" and said nothing about the room (1.0 s). The
+  ignore-the-image-unless-asked instruction holds under the Q2 quant, so
+  unified mode is the shipped path. `pipeline.mode: "split"` remains available
+  as an escape hatch, but nothing so far needs it.
 - **No latency table yet.** The numbers that belong here have to be measured on
   an Orin Nano, not inferred from a desktop.
 
