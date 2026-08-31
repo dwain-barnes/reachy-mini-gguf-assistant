@@ -88,29 +88,88 @@ If any required component is missing on a minimal-L4T system, install `nvidia-je
 
 ### Reachy Mini Lite
 
-1. Connect Reachy Mini Lite to your Jetson via USB. The robot provides camera, microphone, speaker, and motor control over a single USB connection.
+> **In this fork `./setup.sh` does all of the following for you** — the apt
+> packages, both udev rules, the `dialout` group and the SDK — and it is safe to
+> re-run. `./setup.sh --no-robot` skips the lot. What is written out here is
+> what it does and why, which is worth knowing when something does not appear.
 
-2. Add udev rules so the SDK can access the robot's serial ports without root:
+1. Connect Reachy Mini Lite to your Jetson via USB. The robot provides camera, microphone, motor control — and on older revisions a speaker — over a single USB connection.
+
+2. Add udev rules so the SDK can access the robot's serial ports without root.
+   **Two vendor lines, not one.** Upstream documents only the RP2040
+   (`2e8a:000a`); newer robot revisions ship a QinHeng CH343 serial chip
+   (`1a86:55d3`) instead, match no rule at all, and never produce
+   `/dev/reachy_mini`. The 1a86 line is the one that worked on the hardware this
+   fork was brought up on. Shipping both is harmless — the wrong one simply
+   never matches:
 
 ```bash
-echo 'SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000a", MODE="0666", SYMLINK+="reachy_mini"' \
-  | sudo tee /etc/udev/rules.d/99-reachy-mini.rules
+sudo tee /etc/udev/rules.d/99-reachy-mini.rules >/dev/null <<'EOF'
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000a", MODE="0666", SYMLINK+="reachy_mini"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", MODE="0666", SYMLINK+="reachy_mini"
+EOF
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-3. Add your user to the `dialout` group and reboot:
+3. Add your user to the `dialout` group. Group membership only applies to new
+   logins, so log out and back in (or reboot):
 
 ```bash
 sudo usermod -aG dialout $USER
-sudo reboot
 ```
 
 4. Verify the device is visible:
 
 ```bash
-ls -la /dev/ttyACM*
-# Should show /dev/ttyACM0, /dev/ttyACM1, etc.
+ls -la /dev/ttyACM*        # /dev/ttyACM0, and possibly ttyACM1
+ls -la /dev/reachy_mini    # the symlink the rules create -> ttyACM0
+lsusb                      # serial chip, camera, and the USB audio interface
 ```
+
+#### Newer hardware revisions
+
+Everything here was seen on a Reachy Mini Lite driven from a Jetson Orin Nano
+Super. Older units behave as upstream documents; if yours does, none of this
+applies.
+
+- **The microphone array enumerates under the *camera's* name.** On these units
+  the mic array is a USB audio interface belonging to the SunplusIT camera
+  (`38fb:1002`), so PulseAudio lists it as **"Reachy Mini Camera"**, not "Reachy
+  Mini Audio". `config/settings.yaml` therefore hints on the common prefix,
+  which matches both revisions:
+
+  ```yaml
+  audio:
+    input_device: "Reachy Mini"
+  ```
+
+- **There is no USB speaker.** This revision exposes no output sink at all, so
+  speech has to leave by the Jetson's own audio (HDMI or the analog jack).
+  `output_device: "platform-sound"` in `config/settings.yaml` is the shipped
+  default for exactly that reason, and the web UI can switch outputs live.
+
+- **The audio interface sometimes does not enumerate on the first plug.** If
+  `lsusb` shows the camera and the serial chip but no USB audio device, unplug
+  the robot and plug it back in — the interface appears on the second try. This
+  is a USB enumeration race, not a configuration problem, and no amount of
+  restarting the software fixes it.
+
+- **PortAudio must be installed *before* the daemon starts.** `libportaudio2` is
+  a runtime dependency of the Reachy daemon, not just a build one. Without it
+  the daemon does not run without sound, it exits at startup with:
+
+  ```
+  OSError: PortAudio library not found
+  ```
+
+  Installing it while a daemon is already running is not enough — that process
+  has already given up on audio. Kill it so the next connection spawns a fresh
+  one:
+
+  ```bash
+  sudo apt-get install -y libportaudio2 portaudio19-dev
+  pkill -f reachy-mini-daemon
+  ```
 
 ### NVMe Swap (Required for 8GB Jetson)
 
@@ -139,11 +198,16 @@ sudo apt-get install -y \
   python3.10-venv \
   libcairo2-dev \
   libgirepository1.0-dev \
+  libportaudio2 \
   portaudio19-dev \
   libasound2-dev \
   pulseaudio-utils \
   libcudnn9-dev-cuda-12
 ```
+
+`libcairo2-dev`, `libgirepository1.0-dev` and `pkg-config` are needed while pip
+*builds* the SDK's PyGObject/pycairo dependencies. `libportaudio2` is needed to
+*run* the Reachy daemon — see the newer-revision notes above.
 
 The Cairo and GObject development packages are required when PyGObject is built as part of the Reachy Mini media dependencies. Verify that `pkg-config` can find them:
 
@@ -180,10 +244,12 @@ pip install onnxruntime-gpu --extra-index-url https://pypi.jetson-ai-lab.io/jp6/
 
 ### Step 5: Install Reachy Mini SDK
 
-The project is currently runtime-tested with Reachy Mini SDK 1.3.1:
+The project is currently runtime-tested with Reachy Mini SDK 1.3.1. In this fork
+`./setup.sh` installs this pin, along with `scipy`, which the SDK's audio path
+imports but does not declare:
 
 ```bash
-pip install "reachy-mini==1.3.1"
+pip install "reachy-mini==1.3.1" scipy
 ```
 
 Verify the installed version:
@@ -329,6 +395,31 @@ sudo apt-get install -y \
 source venv/bin/activate
 pip install "reachy-mini==1.3.1"
 ```
+
+**The Reachy daemon exits with `OSError: PortAudio library not found`:**
+`libportaudio2` is missing. Install it and kill any daemon that is already
+running, so the next connection starts a fresh one:
+
+```bash
+sudo apt-get install -y libportaudio2 portaudio19-dev
+pkill -f reachy-mini-daemon
+```
+
+**`/dev/reachy_mini` never appears:**
+The robot may use the QinHeng CH343 serial chip rather than the RP2040 upstream
+documents. Check with `lsusb` — `1a86:55d3` needs the second udev line shown in
+[Reachy Mini Lite](#reachy-mini-lite) above. `./setup.sh` writes both.
+
+**No microphone, or the robot's audio interface is missing from `lsusb`:**
+Unplug the robot and plug it back in. On newer revisions the USB audio interface
+sometimes fails to enumerate on the first plug. Also note that on those units
+the mic array is listed as **"Reachy Mini Camera"**, not "Reachy Mini Audio".
+
+**No sound when started with `sudo`:**
+PulseAudio is a per-user service and root cannot reach it. `start.sh` steps back
+down to `$SUDO_USER` for the app process; if you launch
+`run_web_vision_chat.py` by hand, run it as your normal user with
+`export XDG_RUNTIME_DIR=/run/user/$(id -u)` set.
 
 **CUDA or cuDNN is missing on a minimal-L4T installation:**
 Install the complete JetPack stack and reboot:

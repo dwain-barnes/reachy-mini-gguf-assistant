@@ -35,6 +35,26 @@ found into `config/servers.local.json`.
 then the speech model, warms both, and starts the robot. Open the address it
 prints and talk.
 
+### Bring the robot to life
+
+```bash
+# 1. plug the Reachy Mini into the Jetson over USB
+./setup.sh                # re-run it: the robot step is separate and idempotent
+# 2. log out and back in if it just added you to the dialout group
+sudo -v && ./start.sh
+# 3. open http://<jetson>:8090 and speak
+```
+
+Re-running `./setup.sh` with the robot attached is the whole robot install: the
+SDK pin and `scipy` into the venv, the apt packages the daemon needs to run
+(`libportaudio2` above all — without it the daemon exits at startup), both udev
+vendor rules, and `dialout`. `./setup.sh --no-robot` skips it.
+
+The first `start.sh` with the robot connected downloads Pollen's emotions
+library (~172 files) before the first movement — once, then never again. If the
+robot appears on USB with no audio interface, unplug it and plug it back in;
+that revision loses the race on first enumeration.
+
 The `sudo -v` is not for the app. On a Jetson the page cache has to be freed
 immediately before each CUDA allocation, or the load dies with
 `NvMapMemAllocInternalTagged error 12` while `free -m` still shows gigabytes
@@ -82,12 +102,6 @@ Honest position, as of this commit:
   token**, and the speech client returns real 24 kHz audio. 63 tests pass.
   Only a live microphone and speaker remain untested in this phase - the board
   was driven over SSH.
-- **Not yet run on the robot.** Face tracking, speaking gestures, the acoustic
-  echo cancellation and the microphone path itself are inherited from upstream
-  and unchanged, but none of them have been exercised since the model swap. The
-  callback contract the gestures hang off — `on_audio_start` on the first chunk
-  actually played, `on_audio_end` at the end — is pinned by tests, which is not
-  the same as having watched the robot do it.
 - **Phase 2, vision: verified on real hardware.** Real USB-camera frames
   through the fork's own module on the Orin: "what do you see" answered
   sensibly from a live frame (2.2 s); a **spoken** question plus a frame in one
@@ -97,6 +111,23 @@ Honest position, as of this commit:
   ignore-the-image-unless-asked instruction holds under the Q2 quant, so
   unified mode is the shipped path. `pipeline.mode: "split"` remains available
   as an escape hatch, but nothing so far needs it.
+- **Phase 4, the robot: verified on real hardware.** A Reachy Mini Lite on the
+  Orin Nano Super, driven through `run_web_vision_chat.py`. All 9 motors
+  (IDs 10–18) initialise; wake, sleep and gestures were exercised with
+  upstream's `scripts/test_reachy_movement.py`. Running: YuNet face detection,
+  the 100 Hz head controller, face tracking at 15 Hz, the official Pollen
+  speaking movements (the emotions library — 172 files — downloads on the first
+  run), WebRTC echo cancellation across robot-mic → Jetson-audio, and the web UI
+  on `:8090` reporting "Ready — speak anytime!".
+  Two things about this robot revision are worth knowing before you buy into the
+  wiring: the microphone array enumerates under the *camera's* USB name, and
+  **there is no USB speaker at all** — speech leaves by the Jetson's own audio
+  output. Both are already the defaults in `config/settings.yaml`, and
+  [SETUP.md](SETUP.md#newer-hardware-revisions) explains the rest.
+- **Barge-in is still future work (Phase 5).** You cannot yet interrupt the
+  robot mid-sentence; it finishes speaking, then listens. The echo cancellation
+  needed for that is running, but the pipeline does not act on speech detected
+  during playback.
 - **No latency table yet.** The numbers that belong here have to be measured on
   an Orin Nano, not inferred from a desktop.
 
