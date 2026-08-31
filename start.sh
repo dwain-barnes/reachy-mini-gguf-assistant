@@ -475,7 +475,9 @@ if [ "$RUN_APP" -eq 0 ]; then
     step "Servers only (--no-app)"
     ok "language model on $LLM_URL"
     ok "speech on $TTS_URL"
-    info "start the assistant yourself with:"
+    info "start the assistant yourself, as your normal user - not root, because"
+    info "PulseAudio lives in the user session:"
+    info "    export XDG_RUNTIME_DIR=/run/user/\$(id -u)"
     info "    $PYTHON run_web_vision_chat.py"
     echo
     while true; do
@@ -492,9 +494,49 @@ if port_busy "$WEB_PORT"; then
     die "port $WEB_PORT is already in use - another copy of the app may still be running"
 fi
 
-# The app keeps the terminal: its own output is the conversation, and Ctrl+C
-# has to reach it so the robot is put to sleep before the motors are cut.
-"$PYTHON" "$REPO/run_web_vision_chat.py" --host "$WEB_HOST" --port "$WEB_PORT" &
+# Whose HuggingFace cache the app will actually use - root's if it stays root,
+# the invoking user's if it is about to step back down to them.
+APP_HOME="${HOME:-}"
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    APP_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+fi
+
+# The first run downloads Pollen's recorded moves before the robot says
+# anything, and the silence while it does is easy to read as a hang.
+if [ -n "$APP_HOME" ] && [ ! -d "$APP_HOME/.cache/huggingface/hub/models--pollen-robotics--reachy-mini-emotions-library" ]; then
+    info "first run: the Pollen emotions library (~172 files) downloads before the"
+    info "first movement. That happens once; later starts go straight through."
+fi
+
+# The two model servers are happy as root - the app is not. PulseAudio runs in
+# the user's session, so a root process finds no sound server at all: no
+# microphone, no speech out. Since the usual invocation is 'sudo ./start.sh'
+# (or a sudo that escalated for drop_caches), step back down to the invoking
+# user for this one child, carrying the XDG_RUNTIME_DIR that points at their
+# PulseAudio socket.
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    APP_UID="$(id -u "$SUDO_USER")"
+    info "dropping to $SUDO_USER for the app - PulseAudio lives in the user session"
+    # The app keeps the terminal: its own output is the conversation, and Ctrl+C
+    # has to reach it so the robot is put to sleep before the motors are cut.
+    # HOME goes with it: without it the model and emotion-library downloads land
+    # in root's cache and are downloaded again the next time this runs as a
+    # normal user. sudo relays SIGTERM to the command, so shutdown() still
+    # reaches the app and the robot is still put to sleep.
+    sudo -u "$SUDO_USER" \
+        env XDG_RUNTIME_DIR="/run/user/$APP_UID" \
+            HOME="${APP_HOME:-/home/$SUDO_USER}" \
+            LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+        "$PYTHON" "$REPO/run_web_vision_chat.py" --host "$WEB_HOST" --port "$WEB_PORT" &
+else
+    if [ "$(id -u)" -eq 0 ]; then
+        warn "running as root with no SUDO_USER to step back down to. PulseAudio is"
+        warn "a per-user service, so the microphone and speaker will probably be"
+        warn "missing. Start this as your normal user instead: sudo -v && ./start.sh"
+    fi
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    "$PYTHON" "$REPO/run_web_vision_chat.py" --host "$WEB_HOST" --port "$WEB_PORT" &
+fi
 PID_APP=$!
 CHILDREN+=("$PID_APP")
 
