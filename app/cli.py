@@ -12,6 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified by the reachy-mini-gguf-assistant contributors, 2026:
+# 'info' checks the speech server instead of listing Kokoro, and ChromaDB is
+# imported only when a RAG command actually runs - it is optional now.
 
 """CLI — text chat, single question, system info, RAG management."""
 
@@ -26,11 +30,22 @@ import typer
 
 from app.config import Config
 from app.llm import LLM
-from app.rag import KnowledgeBase, RAGRetriever
 from app.monitor import get_system_stats, format_stats
 
+
+def _rag_classes():
+    """Import ChromaDB only when RAG is actually asked for.
+
+    RAG is off by default in this fork and chromadb is not in
+    requirements.txt, so importing app.rag at module scope would break
+    'main.py ask' on a normal install.
+    """
+    from app.rag import KnowledgeBase, RAGRetriever
+    return KnowledgeBase, RAGRetriever
+
+
 console = Console()
-app = typer.Typer(name="assistant", help="Reachy Mini Jetson Assistant", add_completion=False)
+app = typer.Typer(name="assistant", help="Reachy Mini GGUF Assistant", add_completion=False)
 
 
 def _load_llm(config: Config) -> LLM:
@@ -46,10 +61,11 @@ def _load_llm(config: Config) -> LLM:
     return llm
 
 
-def _load_rag(config: Config) -> Optional[RAGRetriever]:
+def _load_rag(config: Config):
     if not config.rag.enabled:
         return None
     try:
+        KnowledgeBase, RAGRetriever = _rag_classes()
         kb = KnowledgeBase(
             persist_dir=config.rag.persist_dir,
             embedding_backend=config.rag.embedding_backend,
@@ -67,7 +83,7 @@ def _load_rag(config: Config) -> Optional[RAGRetriever]:
         return None
 
 
-def _stream(llm: LLM, rag: Optional[RAGRetriever], text: str, system_prompt: str):
+def _stream(llm: LLM, rag, text: str, system_prompt: str):
     """Stream LLM response, print tokens. Returns (full_text, tps, ttft, tokens)."""
     prompt = rag.augment_query(text) if rag else text
     ttft = None
@@ -177,12 +193,27 @@ def info():
                     console.print(f"[green]✓ Ollama[/green]: {', '.join(names[:3])}")
     except Exception:
         console.print(f"[red]✗ LLM not running at {config.llm.base_url}[/red]")
-    for lib, name in [("faster_whisper", "faster-whisper"), ("kokoro_onnx", "kokoro-onnx"), ("chromadb", "ChromaDB")]:
+    try:
+        import httpx
+        with httpx.Client(timeout=5.0) as c:
+            r = c.get(f"{config.tts.base_url.rstrip('/')}/health")
+            if r.status_code == 200:
+                console.print(f"[green]✓ TTS[/green]: {config.tts.base_url}")
+            else:
+                console.print(f"[yellow]⚠ TTS loading ({r.status_code})[/yellow]")
+    except Exception:
+        console.print(f"[red]✗ TTS not running at {config.tts.base_url}[/red]")
+    # Both optional: faster-whisper only for split mode or UI transcripts,
+    # ChromaDB only if RAG has been turned back on.
+    for lib, name, why in [
+        ("faster_whisper", "faster-whisper", "split mode / UI transcripts"),
+        ("chromadb", "ChromaDB", "RAG"),
+    ]:
         try:
             __import__(lib)
             console.print(f"[green]✓ {name}[/green]")
         except ImportError:
-            console.print(f"[yellow]⚠ {name} not installed[/yellow]")
+            console.print(f"[dim]· {name} not installed (optional — {why})[/dim]")
 
 
 @app.command()
@@ -192,6 +223,7 @@ def rag_add(
 ):
     """Add documents to RAG knowledge base."""
     config = Config.load(config_path)
+    KnowledgeBase, _ = _rag_classes()
     kb = KnowledgeBase(
         persist_dir=config.rag.persist_dir, embedding_backend=config.rag.embedding_backend,
         embedding_model=config.rag.embedding_model, embedding_base_url=config.rag.embedding_base_url,
@@ -214,6 +246,7 @@ def rag_add(
 def rag_status(config_path: Optional[str] = typer.Option(None, "--config", "-c")):
     """Show RAG status."""
     config = Config.load(config_path)
+    KnowledgeBase, _ = _rag_classes()
     kb = KnowledgeBase(
         persist_dir=config.rag.persist_dir, embedding_backend=config.rag.embedding_backend,
         embedding_model=config.rag.embedding_model, embedding_base_url=config.rag.embedding_base_url,
@@ -231,6 +264,7 @@ def rag_search(
 ):
     """Search the knowledge base."""
     config = Config.load(config_path)
+    KnowledgeBase, _ = _rag_classes()
     kb = KnowledgeBase(
         persist_dir=config.rag.persist_dir, embedding_backend=config.rag.embedding_backend,
         embedding_model=config.rag.embedding_model, embedding_base_url=config.rag.embedding_base_url,
@@ -254,6 +288,7 @@ def rag_clear(
     config = Config.load(config_path)
     if not force and not typer.confirm("Clear all documents?"):
         return
+    KnowledgeBase, _ = _rag_classes()
     kb = KnowledgeBase(
         persist_dir=config.rag.persist_dir, embedding_backend=config.rag.embedding_backend,
         embedding_model=config.rag.embedding_model, embedding_base_url=config.rag.embedding_base_url,
