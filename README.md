@@ -1,4 +1,4 @@
-# Reachy Mini Jetson Assistant
+# Reachy Mini GGUF Assistant
 
 <p align="center">
   <a href="https://www.pollen-robotics.com/reachy-mini/"><img src="docs/images/reachy-icon.svg" alt="Reachy Mini Lite" height="180"/></a>
@@ -6,298 +6,241 @@
   <a href="https://developer.nvidia.com/embedded/jetson-orin-nano"><img src="docs/images/jetson-family.png" alt="NVIDIA Jetson" height="180"/></a>
 </p>
 
-A low-latency, fully on-device voice and vision assistant for [Reachy Mini Lite](https://www.pollen-robotics.com/reachy-mini/) powered by NVIDIA Jetson. Everything runs locally with GPU acceleration — no cloud, no API keys, no internet required at runtime.
+A voice and vision assistant for [Reachy Mini
+Lite](https://www.pollen-robotics.com/reachy-mini/) on a Jetson Orin Nano,
+running **two GGUF models on llama.cpp** and nothing else. No cloud, no API
+keys, and no speech-to-text stage.
 
-> **Current target:** Jetson Orin Nano 8GB (JetPack 6.x, Python 3.10)
->
-> AGX Orin and Thor support is planned — see [Roadmap](#roadmap).
+A fork of
+[NVIDIA-AI-IOT/reachy-mini-jetson-assistant](https://github.com/NVIDIA-AI-IOT/reachy-mini-jetson-assistant)
+— see [FORK.md](FORK.md) for the fork point and what changed.
 
-## What It Does
+## Install
 
-Speak to Reachy Mini and it responds using a vision-language model that sees through its camera. Reachy tracks and centers the person speaking, then adds expressive head, body, and antenna gestures while it talks. Everything is visible through a browser-based UI with live video, conversation state, and system telemetry.
+```bash
+git clone <this repo> reachy-mini-gguf-assistant
+cd reachy-mini-gguf-assistant
+./setup.sh
+sudo -v && ./start.sh
+```
+
+That is the whole thing. `setup.sh` offers prebuilt JetPack 6 binaries with a
+pinned sha256, so the usual 30–60 minute CUDA build becomes a minute's
+download — pass `--build-from-source` if you would rather compile it yourself,
+which is the honest choice if you do not want to run someone else's binaries.
+It then pulls the two models, makes the virtualenv, and writes the paths it
+found into `config/servers.local.json`.
+
+`start.sh` brings up the language model, waits for it to be genuinely healthy,
+then the speech model, warms both, and starts the robot. Open the address it
+prints and talk.
+
+The `sudo -v` is not for the app. On a Jetson the page cache has to be freed
+immediately before each CUDA allocation, or the load dies with
+`NvMapMemAllocInternalTagged error 12` while `free -m` still shows gigabytes
+"available". `start.sh` does that for you — if sudo does not stop to ask for a
+password.
+
+## What it does
+
+Speak. Reachy hears you — the microphone audio goes to the model *as audio*, so
+nothing has to be transcribed first — looks at you, and answers out loud while
+moving. All of it visible in a browser: live camera, the conversation, system
+telemetry.
 
 ```
-[Mic] → [Silero VAD] → [faster-whisper STT] ──┐
-[USB Camera] → [Frame Ring Buffer] ────────────┼→ [VLM stream] → [TTS stream] → [Speaker + Robot]
-                                               └→ [Web UI via WebSocket]
+[Mic] → [Silero VAD] ─────────────────┐
+[USB Camera] → [Frame ring buffer] ───┼→ [Gemma 4 E2B] → [Pocket TTS] → [Speaker + Robot]
+                                      └→ [Web UI over WebSocket]
 ```
 
-## Demo
+### Two models instead of three
 
-<p align="center">
-  <img src="docs/images/reachy-mini-jetson.png" alt="Reachy Mini Jetson Assistant — Web UI" width="100%"/>
-</p>
+| Upstream ran | This runs |
+|---|---|
+| faster-whisper (STT) | nothing — Gemma hears the raw audio |
+| Cosmos-Reason2-2B (VLM) | **Gemma 4 E2B** — hears, sees and thinks, one `mmproj` for both image and audio |
+| Kokoro ONNX (TTS) | **[EryriLabs Pocket TTS](https://huggingface.co/EryriLabs/pocket-tts-GGUF)** on a warm `llama-tts-server` |
 
-## Expressive Robot Behavior
+Dropping transcription is not only about the second it costs. Whisper turns a
+question into its best guess at words and throws the rest away; the model then
+answers the guess. Here it gets the audio.
 
-The recommended Web Vision Chat mode combines face tracking and speaking gestures through a single 100 Hz motion controller, ensuring that only one component writes motor targets at a time.
+What upstream built and this fork keeps: Silero VAD, YuNet face tracking, the
+100 Hz MovementManager, the official Pollen speaking movements, the camera ring
+buffer, the web UI, the Reachy SDK glue.
 
-### Face Tracking
+## Status — read this before you clone
 
-YuNet-based face tracking gently frames the user with bounded head/body motion, searches when no face is visible, and holds still once the face is good enough for stable VLM capture.
+Honest position, as of this commit:
 
-### Speaking Movements
+- **Phase 1, the voice loop: code complete and tested.** 63 tests pass, and the
+  speech client, the audio-in path and the whole
+  stream → sentences → speech loop have been run against real `llama-server`
+  and `llama-tts-server` processes from a development machine, using WAV files
+  rather than a live microphone.
+- **Not yet run on the robot.** Face tracking, speaking gestures, the acoustic
+  echo cancellation and the microphone path itself are inherited from upstream
+  and unchanged, but none of them have been exercised since the model swap. The
+  callback contract the gestures hang off — `on_audio_start` on the first chunk
+  actually played, `on_audio_end` at the end — is pinned by tests, which is not
+  the same as having watched the robot do it.
+- **Vision under a Q2 quant is untested.** `pipeline.mode: "split"` is kept as
+  the A/B: it puts faster-whisper and a separate VLM back in the path so the
+  two can be compared on the same board.
+- **No latency table yet.** The numbers that belong here have to be measured on
+  an Orin Nano, not inferred from a desktop.
 
-Speaking gestures use curated Pollen Robotics movements, synced with TTS playback and blended with live face tracking so Reachy keeps attending to the user.
+## Modes
 
-Face tracking and speaking movements are configurable under the `reachy` section of `config/settings.yaml`.
-
-## Supported Modes
-
-| Mode | Entry Point | Description |
-|------|-------------|-------------|
-| **Vision Chat** | `python3 run_vision_chat.py` | Camera + VLM + voice (terminal only) |
-| **Web Vision Chat** | `python3 run_web_vision_chat.py` | Same as above + browser UI at `:8090` |
-| **Voice Chat** | `python3 run_voice_chat.py` | Text LLM + optional RAG (no camera) |
-| **Text Chat** | `python3 main.py chat -t` | Interactive text chat (no mic/speaker) |
-| **CLI** | `python3 main.py ask "..."` | Single question, one-shot answer |
+| Mode | Entry point | What it is |
+|---|---|---|
+| **Web Vision Chat** | `python3 run_web_vision_chat.py` | camera + voice + browser UI on `:8090` — what `start.sh` runs |
+| **Vision Chat** | `python3 run_vision_chat.py` | the same, terminal only |
+| **Voice Chat** | `python3 run_voice_chat.py` | no camera |
+| **Text Chat** | `python3 main.py chat -t` | typing, no mic or speaker |
+| **CLI** | `python3 main.py ask "..."` | one question, one answer |
 
 ## Stack
 
-| Component | Library | Acceleration | Notes |
-|-----------|---------|:---:|-------|
-| **VLM** | llama.cpp (Docker) | GPU | Cosmos-Reason2-2B GGUF, OpenAI-compatible API |
-| **LLM** | llama.cpp (Docker) | GPU | Gemma 3 1B for text-only mode |
-| **STT** | faster-whisper | GPU (CUDA) | CTranslate2 with CUDA, small.en default |
-| **TTS** | Kokoro ONNX | GPU (CUDA) | Natural voices, subprocess-isolated (see [License Notes](#license-notes)) |
-| **VAD** | Silero VAD | CPU | Neural VAD, far better than energy-only |
-| **Camera** | OpenCV V4L2 | CPU | Shared latest-frame buffer, configurable resolution/FPS |
-| **Robot** | Reachy Mini SDK + Pollen recorded moves | USB | 100 Hz layered motion, 15 Hz face tracking, expressive TTS gestures |
-| **RAG** | ChromaDB + llama.cpp | GPU | bge-small-en-v1.5 embeddings (voice chat only) |
-| **Web UI** | FastAPI + WebSocket | CPU | Live video, conversation stream, system stats |
+| Piece | What | Where it runs |
+|---|---|---|
+| Thinking, hearing, seeing | Gemma 4 E2B GGUF (`UD-Q2_K_XL`) + `mmproj-F16` | `llama-server`, GPU, port 8080 |
+| Speech | Pocket TTS GGUF + a reference voice | `llama-tts-server`, GPU, port 8100 |
+| VAD | Silero (ONNX) | CPU |
+| Face detection | YuNet via OpenCV | CPU |
+| Robot | Reachy Mini SDK + Pollen recorded moves | USB |
+| Web UI | FastAPI + WebSocket | port 8090 |
 
-## Prerequisites
-
-- **NVIDIA Jetson Orin Nano** (8GB) with JetPack 6.x, Python 3.10, Docker + NVIDIA runtime
-- **[Reachy Mini Lite](https://huggingface.co/docs/reachy_mini/platforms/reachy_mini_lite/get_started)** connected via USB
-- **NVMe SSD** recommended for swap and model storage
-
-## Setup
-
-See **[SETUP.md](SETUP.md)** for the full installation guide — hardware setup, dependencies, Python packages, model downloads, and troubleshooting.
-
-## Usage
-
-### Quick Start (Vision Chat with Web UI)
-
-This is the recommended mode — VLM + camera + voice + browser dashboard:
-
-**Terminal 1** — Start the VLM server:
-
-```bash
-NP=1 ./run_llama_cpp.sh Kbenkhaled/Cosmos-Reason2-2B-GGUF:Q4_K_M
-```
-
-Wait until you see `llama server listening at http://0.0.0.0:8080`.
-
-**Terminal 2** — Start the assistant:
-
-```bash
-source venv/bin/activate
-python3 run_web_vision_chat.py
-```
-
-Open `http://<jetson-ip>:8090` in a browser to see the live UI with camera feed, conversation log, and system stats. The robot listens through its microphone and responds via VLM + TTS.
-
-Press **Ctrl+C** once to exit cleanly (robot will go to sleep position).
-
-### Vision Chat (Terminal Only)
-
-Same pipeline without the web UI:
-
-```bash
-NP=1 ./run_llama_cpp.sh Kbenkhaled/Cosmos-Reason2-2B-GGUF:Q4_K_M
-# In another terminal:
-source venv/bin/activate
-python3 run_vision_chat.py
-```
-
-### Voice Chat (Text LLM, No Camera)
-
-For text-only conversations with optional RAG:
-
-```bash
-./run_llama_cpp.sh ggml-org/gemma-3-1b-it-GGUF:Q8_0
-# For RAG, also start the embedding server:
-./run_llama_embedding.sh ggml-org/bge-small-en-v1.5-Q8_0-GGUF:Q8_0
-
-# In another terminal:
-source venv/bin/activate
-python3 run_voice_chat.py           # with RAG
-python3 run_voice_chat.py --no-rag  # without RAG
-```
-
-### CLI Commands
-
-```bash
-python3 main.py chat -t                        # interactive text chat
-python3 main.py ask "What is the Jetson Orin?"  # single question
-python3 main.py info                            # system info
-python3 main.py rag-status                      # RAG index status
-python3 main.py rag-search "GPU specs"          # search the knowledge base
-```
-
-### Test Robot Movement
-
-```bash
-python3 scripts/test_reachy_movement.py
-```
-
-### Stopping
-
-```bash
-# Stop the LLM/VLM Docker container:
-docker stop assistant-llm
-
-# Stop the embedding server (if running):
-docker stop assistant-embed
-```
-
-## Web UI
-
-The web UI (`run_web_vision_chat.py`) provides a real-time dashboard accessible from any browser on the same network:
-
-- **Live camera feed** from the shared camera buffer, including face-detection and tracking state, with VLM capture using the latest stable frame
-- **Conversation log** with streaming VLM responses
-- **Push-to-talk** button (starts muted, click to unmute)
-- **System stats** — CPU, GPU, RAM usage
-- **Config panel** — displays active settings
-- **Platform detection** — shows the specific Jetson model
-
-Access at `http://<jetson-ip>:8090`. The web UI adds minimal overhead (~5 MB RAM).
+Roughly 4.0 GiB of GPU and 6.8 GiB in total on an 8 GB Orin Nano, leaving about
+0.6 GiB of headroom. That is why `contextSize` is 2048, and why raising it is
+the first thing that will break this: the KV cache comes out of the same pool
+as the weights.
 
 ## Configuration
 
-All settings live in `config/settings.yaml`. Edit this file to tune behavior:
+Two files, doing different jobs:
 
-| Section | What It Controls |
-|---------|-----------------|
-| `llm` | LLM server URL, model, temperature, max tokens, system prompts |
-| `stt` | Whisper model size, CUDA device, beam size |
-| `tts` | Voice, speed, language, chunking |
-| `audio` | Sample rate, input device |
+- **`config/settings.yaml`** — how the assistant behaves. Edit freely.
+- **`config/servers.local.json`** — where the binaries and models are, and
+  which ports. Written by `setup.sh`; edit it if you move things.
+
+| Section | Controls |
+|---|---|
+| `pipeline` | `unified` (audio straight to the model) or `split` (STT + a separate VLM); whether to run Whisper purely to show the words in the UI |
+| `llm` | server URL, token budget, temperature, system prompts |
+| `tts` | speech server URL, voice name, runaway cap |
+| `stt` | Whisper settings — split mode only |
+| `audio` | devices, echo cancellation |
 | `vad` | Silero threshold, silence duration, utterance filters |
-| `vision` | Camera resolution, capture FPS, frames per query, VLM system prompt, few-shot examples |
-| `reachy` | Robot connection, daemon behavior, horizontal/vertical tracking, scan/reacquisition, capture settling, and speaking movements |
+| `vision` | camera resolution, capture FPS, frames per query, prompt, few-shot |
+| `reachy` | connection, face tracking, speaking movements |
 | `web` | UI FPS, host, port |
-| `rag` | Embedding backend, knowledge directory, retrieval settings |
+| `rag` | off — a third model does not fit next to the other two |
 
-For developers adding new config fields, see `app/config.py` — typed dataclasses that define the schema and fallback defaults. The YAML always wins at runtime; the dataclass default is used if a key is missing from YAML.
+The ports have to agree across the two files: `llm.base_url` ↔ `llmPort`,
+`tts.base_url` ↔ `ttsPort`, `web.port` ↔ `webUiPort`.
 
-## Project Structure
+### Speech on the CPU
+
+`"ttsOnGpu": false` in `config/servers.local.json` moves Pocket TTS to the CPU
+and hands the whole GPU to Gemma. It costs about 19 seconds a sentence on an
+Orin Nano — fine for testing, not for conversation. You want it if you move to
+a bigger quant, which is the other lever: `./setup.sh --quant UD-Q4_K_XL
+--force` answers better and stops leaving room for speech on the GPU.
+
+## When something else owns the GPU
+
+Many Jetsons boot with a GPU service already running (NanoOWL,
+`jetson-inference`, a stray container). Stop it for the session:
+
+```bash
+systemctl list-units --type=service --state=running | grep -i 'nano\|owl\|jetson'
+sudo systemctl stop <service>
+```
+
+Do not `disable` it — that is your own setup, and it should come back on the
+next boot. Do not `pkill` it either: services restart on failure, and
+containers keep holding GPU memory after the visible process dies.
+
+## Project structure
 
 ```
-reachy-mini-jetson-assistant/
+reachy-mini-gguf-assistant/
 ├── app/
-│   ├── pipeline.py          # Audio I/O, VAD, TTS streaming, mic recording
-│   ├── config.py            # Configuration dataclasses + YAML loader
-│   ├── llm.py               # LLM/VLM client (OpenAI-compatible, multimodal)
-│   ├── stt.py               # faster-whisper speech-to-text
-│   ├── tts.py               # TTS client (spawns subprocess worker)
-│   ├── tts_worker.py        # TTS subprocess (Kokoro + GPL deps, isolated)
-│   ├── camera.py            # USB webcam ring buffer (OpenCV, V4L2)
-│   ├── face_detector.py     # YuNet face detection (OpenCV CPU)
-│   ├── face_tracker.py      # 15 Hz horizontal/vertical visual tracking
-│   ├── movement_manager.py  # Single-writer 100 Hz layered motion controller
-│   ├── speaking_movements.py # Curated official Pollen TTS gestures
-│   ├── vision_capture.py    # Stable-frame acquisition and motion settling
-│   ├── reachy.py            # Reachy Mini connection, daemon management
-│   ├── web.py               # FastAPI + WebSocket server for browser UI
-│   ├── monitor.py           # System resource monitoring (CPU/GPU/RAM)
-│   ├── rag.py               # ChromaDB + embeddings retrieval
-│   ├── audio.py             # PulseAudio / ALSA device helpers
-│   └── cli.py               # Typer CLI (chat, ask, rag-*)
+│   ├── pipeline.py           # audio I/O, VAD, utterance → WAV, sentence-paced playback
+│   ├── tts_client.py         # llama-tts-server client (new in this fork)
+│   ├── sentence_split.py     # sentence boundaries for a token stream (new in this fork)
+│   ├── llm.py                # chat client: text + audio + images
+│   ├── stt.py                # faster-whisper — split mode only
+│   ├── config.py             # typed config + YAML loader
+│   ├── camera.py             # USB webcam ring buffer
+│   ├── face_detector.py      # YuNet
+│   ├── face_tracker.py       # 15 Hz visual tracking
+│   ├── movement_manager.py   # single-writer 100 Hz motion controller
+│   ├── speaking_movements.py # official Pollen gestures, synced to speech
+│   ├── vision_capture.py     # stable-frame capture
+│   ├── reachy.py             # robot connection and daemon
+│   ├── web.py                # FastAPI + WebSocket
+│   ├── monitor.py            # CPU/GPU/RAM
+│   ├── rag.py                # optional retrieval
+│   ├── audio.py              # PulseAudio / ALSA helpers
+│   └── cli.py                # Typer CLI
 ├── config/
-│   └── settings.yaml        # All runtime configuration
-├── static/
-│   └── index.html           # Web UI (single-file HTML/CSS/JS)
-├── scripts/
-│   ├── bench_ttft.py        # VLM TTFT benchmark
-│   ├── test_reachy_movement.py   # Robot movement test
-│   └── test_vlm_prompts.py  # VLM prompt experiments
-├── knowledge_base/          # Markdown docs for RAG
-├── models/                  # Local GGUF models (gitignored)
-├── voices/                  # TTS voice files (gitignored)
-├── run_web_vision_chat.py   # Vision chat + web UI (recommended)
-├── run_vision_chat.py       # Vision chat (terminal only)
-├── run_voice_chat.py        # Voice chat with optional RAG
-├── run_llama_cpp.sh         # Docker LLM/VLM server launcher
-├── run_llama_embedding.sh   # Docker embedding server launcher
-├── main.py                  # CLI entry point
-└── requirements.txt         # Python dependencies
+│   ├── settings.yaml         # behaviour
+│   ├── servers.json          # template for the launcher
+│   └── servers.local.json    # written by setup.sh (gitignored)
+├── legacy/                   # upstream's Docker launchers, retired
+├── setup.sh                  # one-time install
+├── start.sh                  # start everything, in the right order
+└── tests/                    # 63 tests, no hardware needed
 ```
 
-## Performance Notes (Orin Nano 8GB)
+## Tests
 
-| Metric | Value |
-|--------|-------|
-| STT latency | ~0.7s (small.en, beam=1) |
-| VLM TTFT (warm cache) | ~6–8s (Cosmos-Reason2-2B Q4_K_M) |
-| VLM TTFT (cold) | ~8–10s |
-| TTS latency (first chunk) | ~0.3s (Kokoro GPU) |
-| End-to-end (speak → robot responds) | ~8–12s |
-| Peak RAM | ~7.5 GB (STT + VLM + TTS + camera + web UI) |
+```bash
+python3 -m pytest tests/
+```
 
-The VLM vision encoder prefill is the primary bottleneck on Orin Nano. Flash attention (`-fa on`) and KV cache prefix reuse (`--cache-reuse 256`) are enabled in `run_llama_cpp.sh` to minimize repeated work across queries.
+No robot, GPU or microphone required: both servers are stubbed with a real HTTP
+server on localhost.
 
-## Development and Validation
+## Credit
 
-This project was developed and validated on the [NVIDIA Jetson platform](https://developer.nvidia.com/embedded-computing) with assistance from [Jetson Device Skills](https://github.com/NVIDIA-AI-IOT/jetson-device-skills), a collection of foundational agent skills for working with Jetson devices.
+- **[NVIDIA-AI-IOT](https://github.com/NVIDIA-AI-IOT/reachy-mini-jetson-assistant)**
+  wrote the assistant this forks: the pipeline, the face tracking, the motion
+  controller, the web UI. Apache-2.0.
+- **[Pollen Robotics](https://www.pollen-robotics.com/reachy-mini/)** make
+  Reachy Mini, and the movement library the gestures come from.
+- **[Kyutai](https://huggingface.co/kyutai/tts-voices)** for the TTS voice work,
+  and **[EryriLabs](https://huggingface.co/EryriLabs/pocket-tts-GGUF)** for the
+  Pocket TTS GGUF conversion. CC-BY-4.0 — if you publish audio from this,
+  credit them.
+- **[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)** for both
+  servers, and
+  **[llama-tts-server](https://github.com/dwain-barnes/llama-tts-server)** for
+  the patch that keeps the speech model warm between sentences.
 
-Jetson Device Skills supported hardware inspection, [JetPack](https://developer.nvidia.com/embedded/jetpack) and CUDA environment validation, dependency verification, performance diagnostics, and device-level troubleshooting during development and bring-up.
+Full list in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Gemma is under
+Google's [Gemma Terms of Use](https://ai.google.dev/gemma/terms), not an OSI
+licence.
 
-Jetson Device Skills are development and validation tools only. They are not packaged with this application and are not required to install or run the Reachy Mini assistant.
-
-## Roadmap
-
-- [x] Orin Nano 8GB — full pipeline validated
-- [x] Web UI with live camera, conversation log, push-to-talk
-- [x] Kokoro TTS GPU acceleration
-- [x] Silero VAD for robust speech detection
-- [x] KV cache reuse + flash attention for faster VLM TTFT
-- [x] 15 Hz horizontal and vertical face tracking with bounded search and reacquisition
-- [x] TTS-synchronized head, body, and antenna movements from the official Pollen library
-- [ ] **AGX Orin** — larger models (Cosmos-Reason2-7B, Gemma 3 4B), higher resolution, multi-turn context
-- [ ] **Thor** — real-time VLM, multi-camera, extended context windows
-- [ ] Multi-turn conversation memory
-- [ ] Multi-language support
-
-Contributions for AGX Orin and Thor testing are welcome.
-
-## Troubleshooting
-
-See [SETUP.md](SETUP.md#troubleshooting) for common issues and fixes.
-
-## Reachy Mini Resources
+## Reachy Mini resources
 
 | Resource | Link |
 |----------|------|
-| Getting Started | [huggingface.co/docs/reachy_mini](https://huggingface.co/docs/reachy_mini/index) |
-| Reachy Mini Lite Setup | [Lite Guide](https://huggingface.co/docs/reachy_mini/platforms/reachy_mini_lite/get_started) |
-| Python SDK Docs | [SDK Reference](https://huggingface.co/docs/reachy_mini/SDK/readme) |
-| Quickstart | [First Behavior](https://huggingface.co/docs/reachy_mini/SDK/quickstart) |
-| AI Integrations | [LLMs, Apps, HF Spaces](https://huggingface.co/docs/reachy_mini/SDK/integration) |
-| Core Concepts | [Architecture & Coordinates](https://huggingface.co/docs/reachy_mini/SDK/core-concept) |
-| Code Examples | [github.com/pollen-robotics/reachy_mini/examples](https://github.com/pollen-robotics/reachy_mini/tree/main/examples) |
-| Community Apps | [Hugging Face Spaces](https://hf.co/reachy-mini/#/apps) |
-| Discord | [Join the Community](https://discord.gg/Y7FgMqHsub) |
-| Troubleshooting | [FAQ Guide](https://huggingface.co/docs/reachy_mini/troubleshooting) |
-
-## License Notes
-
-This project uses [Kokoro ONNX](https://github.com/thewh1teagle/kokoro-onnx) for text-to-speech. Kokoro ONNX itself is MIT-licensed, but it depends on:
-
-- **phonemizer-fork** — GPL-3.0 (text-to-phoneme conversion)
-- **espeak-ng** — GPL-3.0 (speech synthesis library loaded by `espeakng-loader`)
-
-To avoid loading GPL-licensed code into the same process as NVIDIA CUDA libraries, TTS runs in a **separate subprocess** (`app/tts_worker.py`). The main application process never imports `kokoro-onnx`, `phonemizer-fork`, or `espeak-ng` — it communicates with the TTS worker via JSON over stdin/stdout. This is the same process-boundary isolation pattern used by the `llama.cpp` VLM backend (which runs in a separate Docker container).
-
-All other dependencies use permissive licenses (MIT, BSD-3, Apache-2.0). See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list.
+| Getting started | [huggingface.co/docs/reachy_mini](https://huggingface.co/docs/reachy_mini/index) |
+| Reachy Mini Lite setup | [Lite guide](https://huggingface.co/docs/reachy_mini/platforms/reachy_mini_lite/get_started) |
+| Python SDK | [SDK reference](https://huggingface.co/docs/reachy_mini/SDK/readme) |
+| Examples | [github.com/pollen-robotics/reachy_mini/examples](https://github.com/pollen-robotics/reachy_mini/tree/main/examples) |
+| Discord | [Community](https://discord.gg/Y7FgMqHsub) |
 
 ## Contributing
 
-We welcome community contributions. Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines, including the Developer Certificate of Origin (DCO) sign-off requirement.
+See [CONTRIBUTING.md](CONTRIBUTING.md), inherited from upstream, including the
+Developer Certificate of Origin sign-off.
 
-## License
+## Licence
 
-Apache 2.0 — see [LICENSE](LICENSE) for details.
+Apache-2.0, same as upstream — see [LICENSE](LICENSE). Every file NVIDIA wrote
+keeps its copyright header; every file this fork changed says so underneath.

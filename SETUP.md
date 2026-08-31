@@ -1,6 +1,20 @@
 # Setup Guide
 
-Full installation instructions for the Reachy Mini Jetson Assistant.
+> **Modified by the reachy-mini-gguf-assistant contributors, 2026.**
+>
+> **Most of this page is history now.** In this fork `./setup.sh` does the
+> install: it fetches or builds the two llama.cpp servers, downloads Gemma 4
+> E2B and Pocket TTS, makes the virtualenv and writes the launcher config. Then
+> `sudo -v && ./start.sh`. See the [README](README.md).
+>
+> Still worth reading here: the hardware list, the JetPack 6 / Python 3.10
+> requirement, the PulseAudio and Reachy Mini wiring, the swap advice and the
+> troubleshooting section. No longer applies: Docker and `run_llama_cpp.sh`
+> (retired to `legacy/`), the faster-whisper install, the Kokoro voice
+> downloads, the ChromaDB and RAG steps. Those describe the upstream
+> three-model pipeline this fork replaced.
+
+Full installation instructions for the upstream Reachy Mini Jetson Assistant.
 
 ## Prerequisites
 
