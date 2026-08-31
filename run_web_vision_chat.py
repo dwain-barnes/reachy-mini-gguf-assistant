@@ -563,6 +563,13 @@ def main():
 
             console.print()
 
+            # With no transcript there is no filler gate: a cough or a door
+            # closing goes to the model like anything else. The model saying
+            # nothing back is what stands in for it - nothing is spoken, and
+            # the turn ends here.
+            if not full_resp.strip():
+                console.print("[dim]  (no reply — probably not speech)[/dim]")
+
             toks = len(full_resp.split())
             stability = "stable" if stable_at_capture else "latest"
             heard = f"STT {dt_stt:.1f}s" if stt is not None else "audio direct"
