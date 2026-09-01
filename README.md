@@ -9,7 +9,7 @@
 A voice and vision assistant for [Reachy Mini
 Lite](https://www.pollen-robotics.com/reachy-mini/) on a Jetson Orin Nano,
 running **two GGUF models on llama.cpp** and nothing else. No cloud, no API
-keys, and no speech-to-text stage.
+keys, and no speech-to-text model — it hears you directly.
 
 A fork of
 [NVIDIA-AI-IOT/reachy-mini-jetson-assistant](https://github.com/NVIDIA-AI-IOT/reachy-mini-jetson-assistant)
@@ -78,13 +78,23 @@ telemetry.
 
 | Upstream ran | This runs |
 |---|---|
-| faster-whisper (STT) | nothing — Gemma hears the raw audio |
+| faster-whisper (STT) | nothing — Gemma hears the raw audio, and writes it down itself afterwards for the browser |
 | Cosmos-Reason2-2B (VLM) | **Gemma 4 E2B** — hears, sees and thinks, one `mmproj` for both image and audio |
 | Kokoro ONNX (TTS) | **[EryriLabs Pocket TTS](https://huggingface.co/EryriLabs/pocket-tts-GGUF)** on a warm `llama-tts-server` |
 
 Dropping transcription is not only about the second it costs. Whisper turns a
 question into its best guess at words and throws the rest away; the model then
 answers the guess. Here it gets the audio.
+
+What that costs is the transcript in the browser, which shows *🎤 spoken* and
+how long you spoke for, because nothing wrote the words down. So once the reply
+is finished and spoken, Gemma is asked one extra question — what did that clip
+say? — and the chip becomes the words. It happens after the answer, never
+before it and never alongside it, so nothing is slowed down; and it yields
+immediately to the next thing you say, because `llama-server` runs one request
+at a time and the conversation matters more than the caption. Talking again
+therefore costs you the transcript, not the speed.
+`pipeline.transcribe_after_reply: false` turns it off.
 
 What upstream built and this fork keeps: Silero VAD, YuNet face tracking, the
 100 Hz MovementManager, the official Pollen speaking movements, the camera ring
@@ -99,7 +109,7 @@ Honest position, as of this commit:
   8 GB: both models load in ~27 s, a text question through the CLI answers with
   a **794 ms first token at 12.5 tok/s**, a spoken WAV through the fork's own
   `generate_stream(audio_b64=...)` answers correctly with a **1.19 s first
-  token**, and the speech client returns real 24 kHz audio. 63 tests pass.
+  token**, and the speech client returns real 24 kHz audio. 83 tests pass.
   Only a live microphone and speaker remain untested in this phase - the board
   was driven over SSH.
 - **Phase 2, vision: verified on real hardware.** Real USB-camera frames
@@ -124,6 +134,20 @@ Honest position, as of this commit:
   **there is no USB speaker at all** — speech leaves by the Jetson's own audio
   output. Both are already the defaults in `config/settings.yaml`, and
   [SETUP.md](SETUP.md#newer-hardware-revisions) explains the rest.
+- **Writing down what you said: code complete, to be measured on the board.**
+  After each reply the clip goes back to Gemma to be transcribed, and the
+  browser's *🎤 spoken* chip becomes the words. It is written to yield: the
+  request is only made once the reply has been given and spoken, a new
+  utterance stops it being made at all, and one already in flight has its
+  connection closed under it so the single `llama-server` slot goes straight
+  back to the conversation. What exists is 20 tests against a stub server
+  covering the request, the skip and the hang-up, and the same mechanism
+  running against a real llama-server in the sibling
+  [jetson-voice-assistant](https://github.com/dwain-barnes/jetson-voice-assistant).
+  What does *not* exist is a single measurement on this board: how long the
+  second pass takes on an Orin, and whether a turn is ever slowed down by the
+  previous turn's transcript being hung up on. Until those numbers exist, treat
+  it as unproven on hardware.
 - **Barge-in is still future work (Phase 5).** You cannot yet interrupt the
   robot mid-sentence; it finishes speaking, then listens. The echo cancellation
   needed for that is running, but the pipeline does not act on speech detected
@@ -167,7 +191,7 @@ Two files, doing different jobs:
 
 | Section | Controls |
 |---|---|
-| `pipeline` | `unified` (audio straight to the model) or `split` (STT + a separate VLM); whether to run Whisper purely to show the words in the UI |
+| `pipeline` | `unified` (audio straight to the model) or `split` (STT + a separate VLM); whether to run Whisper purely to show the words in the UI; whether to ask the model itself for those words after the reply |
 | `llm` | server URL, token budget, temperature, system prompts |
 | `tts` | speech server URL, voice name, runaway cap |
 | `stt` | Whisper settings — split mode only |
@@ -213,6 +237,7 @@ reachy-mini-gguf-assistant/
 │   ├── sentence_split.py     # sentence boundaries for a token stream (new in this fork)
 │   ├── llm.py                # chat client: text + audio + images
 │   ├── stt.py                # faster-whisper — split mode only
+│   ├── after_transcript.py   # the words, asked for after the reply is out
 │   ├── config.py             # typed config + YAML loader
 │   ├── camera.py             # USB webcam ring buffer
 │   ├── face_detector.py      # YuNet
@@ -233,7 +258,7 @@ reachy-mini-gguf-assistant/
 ├── legacy/                   # upstream's Docker launchers, retired
 ├── setup.sh                  # one-time install
 ├── start.sh                  # start everything, in the right order
-└── tests/                    # 63 tests, no hardware needed
+└── tests/                    # 83 tests, no hardware needed
 ```
 
 ## Tests

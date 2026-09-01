@@ -25,6 +25,8 @@ and an image_url part → Gemma 4 E2B answered using both modalities.)
   the A/B escape hatch - keep app/stt.py in tree for this)
 - vision.vlm_base_url: "" (used by split mode)
 - pipeline.transcribe_for_display: false (opt-in real transcripts, needs -np 2)
+- pipeline.transcribe_after_reply: true (the same words, asked of Gemma once
+  the reply is out; one slot is enough, and a new utterance cancels it)
 - tts: base_url http://127.0.0.1:8100, voice, max_seconds; retire
   first_chunk_words/max_chunk_words
 - Ports: llama-server 8080 (their llm.base_url default), tts 8100, web UI 8090.

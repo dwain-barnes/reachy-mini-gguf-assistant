@@ -61,6 +61,12 @@ class PipelineConfig:
     # unified mode, a second llama-server slot (-np 2). Off by default; the UI
     # shows a "spoken" chip with the utterance length instead.
     transcribe_for_display: bool = False
+    # The other way to fill that chip in, and the cheap one: after the reply is
+    # finished and spoken, ask Gemma itself what the clip said. Costs no second
+    # model and no second slot - it never overlaps the reply, and a new
+    # utterance cancels it outright. Unified mode only; split mode already has
+    # the real words.
+    transcribe_after_reply: bool = True
 
 
 @dataclass

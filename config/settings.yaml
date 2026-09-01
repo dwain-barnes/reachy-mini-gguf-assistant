@@ -26,6 +26,12 @@ pipeline:
   transcribe_for_display: false       # true runs Whisper as well, only to show the words in
                                       # the web UI. Costs a second model, and in unified mode
                                       # a second llama-server slot (start it with -np 2).
+  transcribe_after_reply: true        # the cheap way to fill in the same words: once the reply
+                                      # has been given and spoken, ask Gemma what the clip said
+                                      # and patch the chip in the browser. No second model and
+                                      # no second slot - it never overlaps the reply, and
+                                      # talking again cancels it. Unified mode only, and
+                                      # ignored when transcribe_for_display already has words.
 
 llm:
   model: ""                           # empty = auto-detect from server

@@ -137,6 +137,12 @@ header{display:flex;align-items:center;justify-content:space-between;
 .cursor-blink::after{content:'';display:inline-block;width:7px;height:13px;background:var(--accent);
   margin-left:2px;vertical-align:text-bottom;animation:blink .7s step-end infinite}
 @keyframes blink{50%{opacity:0}}
+/* The chip turning into the words it stood for. An animation rather than a
+   class toggled next frame, so the resting state is "visible" even in a tab
+   that was in the background when it landed. */
+.msg .content.written-down{animation:written-in .25s ease}
+@keyframes written-in{from{opacity:.3}to{opacity:1}}
+@media (prefers-reduced-motion: reduce){.msg .content.written-down{animation:none}}
 .empty-state{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--dim);font-size:.85rem;text-align:center;padding:16px}
 
 
@@ -339,6 +345,7 @@ footer{display:flex;align-items:center;gap:14px;padding:5px 20px;background:var(
         case 'frame':        onFrame(msg); break;
         case 'status':       onStatus(msg); break;
         case 'transcript':   onTranscript(msg); break;
+        case 'transcript_update': onTranscriptUpdate(msg); break;
         case 'token':        onToken(msg); break;
         case 'done':         onDone(msg); break;
         case 'stats':        onStats(msg); break;
@@ -495,10 +502,34 @@ footer{display:flex;align-items:center;gap:14px;padding:5px 20px;background:var(
       + `<div class="meta">${msg.stt_time ? 'STT '+msg.stt_time.toFixed(1)+'s'
                                           : (spoken ? 'heard directly' : '')}`
       + `${msg.duration ? ' \u00b7 '+msg.duration.toFixed(1)+'s' : ''}</div>`;
+    if(msg.turnId != null) div.dataset.turn = msg.turnId;
     $('messages').appendChild(div);
     scrollChat();
     msgIdx++;
     updateMsgCount();
+  }
+
+  /* The same bubble, once the model has been asked what was in the clip —
+     which happens after the reply is finished, so this can land while the next
+     answer is already being read. The words take the place of the chip and the
+     microphone moves down to the meta line, so it still reads as something
+     that was said out loud rather than typed. Nothing is added to the message
+     count: this is the same message, filled in. */
+  function onTranscriptUpdate(msg){
+    if(msg.turnId == null || !msg.text) return;
+    const div = $('messages').querySelector('.msg.user[data-turn="'+msg.turnId+'"]');
+    if(!div || div.dataset.transcribed === '1') return;
+    div.dataset.transcribed = '1';
+    const content = div.querySelector('.content');
+    if(content){
+      content.textContent = msg.text;
+      content.style.opacity = '';
+      content.style.fontStyle = '';
+      content.classList.add('written-down');
+    }
+    const meta = div.querySelector('.meta');
+    if(meta) meta.textContent = '\u{1F3A4} ' + meta.textContent;
+    scrollChat();
   }
 
   function onToken(msg){

@@ -46,6 +46,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from app.config import Config
+from app.after_transcript import AfterTranscriber
 from app.audio import find_alsa_device
 from app.llm import LLM
 from app.tts_client import create_tts
@@ -207,6 +208,7 @@ def main():
     stt = None
     llm = None
     tts = None
+    transcriber = None
     # ── Cleanup handler ──────────────────────────────────────────
     _cleanup_done = threading.Event()
 
@@ -215,6 +217,10 @@ def main():
             return
         _cleanup_done.set()
         console.print("\n[yellow]Shutting down...[/yellow]")
+        if transcriber:
+            # Nobody is going to read a transcript of a conversation that has
+            # just ended, and the model can stop generating it now.
+            transcriber.cancel()
         if mic:
             try:
                 mic.stop()
@@ -277,6 +283,19 @@ def main():
     )
     llm.load()
     console.print(f"  ✓ VLM ({llm.model})")
+
+    # Filling in the "spoken" chip after the fact, using the model that already
+    # heard the clip. Only worth doing when nothing else produced the words:
+    # split mode has real STT text, and so does transcribe_for_display.
+    transcribe_after = (unified and config.pipeline.transcribe_after_reply
+                        and not want_transcript)
+    transcriber = AfterTranscriber(
+        broadcaster, base_url=config.llm.base_url, model=llm.model,
+        enabled=transcribe_after,
+        log=lambda msg: console.print(f"[dim]  ({msg})[/dim]"),
+    )
+    if transcribe_after:
+        console.print("  ✓ Transcripts written down after each reply (display only)")
 
     tts = create_tts(
         base_url=config.tts.base_url, voice=config.tts.voice,
@@ -428,6 +447,13 @@ def main():
     # ── Main loop ────────────────────────────────────────────────
     try:
         for segment in vad_loop(mic, console, vad_cfg=config.vad, silero=silero_model):
+            # The VAD handing over an utterance is the one unambiguous "a new
+            # turn has started" in this loop, and it is the signal the
+            # after-the-fact transcription yields to: anything the previous
+            # turn left running is hung up on here, before the camera is even
+            # touched.
+            turn_id = transcriber.begin_turn()
+
             if not broadcaster.ptt_active:
                 broadcaster.send({"type": "status", "stage": "muted"})
                 mic.resume()
@@ -489,6 +515,7 @@ def main():
             # saying how long the person spoke for instead of their words.
             transcript_msg = {
                 "type": "transcript",
+                "turnId": turn_id,
                 "text": text or "(spoken)",
                 "duration": round(segment.duration, 1),
             }
@@ -590,6 +617,14 @@ def main():
             broadcaster.send({"type": "status", "stage": "listening"})
 
             mic.resume()
+
+            # Last thing in the turn, and on a thread: the reply has been given
+            # and spoken, the microphone is open again, and only now is it
+            # anybody's business what the words were. A model that answered
+            # nothing was probably not answering speech, so there is nothing
+            # worth writing down either.
+            if full_resp.strip() and not text:
+                transcriber.after_reply(turn_id, audio_b64)
 
     except (KeyboardInterrupt, SystemExit):
         pass

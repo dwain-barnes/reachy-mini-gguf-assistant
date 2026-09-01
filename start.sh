@@ -110,8 +110,12 @@ TTS_URL="http://127.0.0.1:$TTS_PORT"
 PYTHON="$REPO/venv/bin/python3"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
 
-# A transcript for the browser means a second request in flight while the
-# conversation one is still streaming, so the server needs a second slot.
+# A Whisper transcript for the browser means a second request in flight while
+# the conversation one is still streaming, so the server needs a second slot.
+# pipeline.transcribe_after_reply does not: it only ever asks once the reply is
+# finished and spoken, and a new utterance hangs up on it rather than queueing
+# behind it. The single slot is the point there - it is what makes the
+# conversation win.
 PARALLEL=1
 if "$PYTHON" - "$REPO/config/settings.yaml" <<'PY' 2>/dev/null
 import sys, yaml
